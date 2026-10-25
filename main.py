@@ -1,6 +1,7 @@
-from flask import Flask, request, jsonify
+\from flask import Flask, request, jsonify
 import pdfplumber
 import io
+import re
 
 app = Flask(__name__)
 
@@ -17,25 +18,16 @@ def parse_calendar():
     pdf_bytes = pdf_file.read()
     results = []
     
-    # NEW: Highly aggressive table settings to force a 7-column grid without relying on physical lines
-    custom_table_settings = {
-        "vertical_strategy": "text",
-        "horizontal_strategy": "text",
-        "snap_tolerance": 5,
-        "join_tolerance": 5
-    }
-
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page_num, page in enumerate(pdf.pages):
-            # Extract tables using the new text-alignment strategy
-            tables = page.extract_tables(table_settings=custom_table_settings)
-            
-            for table in tables:
-                for row in table:
-                    # Clean empty cell values
-                    cleaned_row = [cell.strip().replace('\n', ' ') if cell else "" for cell in row]
-                    if any(cleaned_row):
-                        results.append(cleaned_row)
+        for page in pdf.pages:
+            # Read the page visually exactly as a human sees it
+            text = page.extract_text(layout=True)
+            if text:
+                for line in text.split('\n'):
+                    # Split into columns wherever there are 2 or more consecutive spaces
+                    cols = [col.strip() for col in re.split(r' {2,}', line) if col.strip()]
+                    if cols:
+                        results.append(cols)
                         
     return jsonify({"page_count": len(pdf.pages), "grid_rows": results})
 
