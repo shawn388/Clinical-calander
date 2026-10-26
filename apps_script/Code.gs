@@ -68,7 +68,13 @@ function clinicalRoster_(ss,state,env) {
     }
     const idCol=headers.indexOf('Student ID');
     values.slice(1).forEach((r,i)=>{
-      if(r.every(v=>v==='')) return;
+      if(r.every(v=>v===''||v===false)) {
+        // Google returns unchecked template checkboxes as false, not blank.
+        state.reviews.filter(review=>review.category==='INVALID_ROSTER_ROW'&&review.source_id===tab+':'+(i+2)&&review.status==='OPEN').forEach(review=>{
+          review.status='RESOLVED';review.resolution='Verified empty template row: only blank values and unchecked checkboxes';review.resolved_at=new Date().toISOString();
+        });
+        return;
+      }
       rows.push({first_name:String(r[idx['First Name']]||'').trim(),last_name:String(r[idx['Last Name']]||'').trim(),email:String(r[idx.Email]||'').trim(),
         cohort:String(r[idx['Cohort/Class #']]||''),student_id:idCol>=0?String(r[idCol]||'').trim():'',source_tab:tab,source_row:i+2,status:tab==='Archive'?'ARCHIVED':'ACTIVE'});
     });
