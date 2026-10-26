@@ -48,7 +48,7 @@ Responses use schema version 2:
 
 - `source_sha256`, `generated_at`, `parser_version`, `page_count` identify the source and parser.
 - `shifts` contains ISO dates, printed start/end times, offset-aware instants, timezone, raw student names, location, page, bounding boxes, raw text and original word coordinates.
-- `coverage` lists validated printed date windows for each page/site. The filename is checked against printed months; its month range does not stand in for exact coverage.
+- `coverage` lists validated printed date windows for each page/site. The filename must match either the printed month window or its exclusive upper-bound month; the chosen convention is recorded. Its month range does not stand in for exact coverage. A trailing parenthesized account identifier containing a digit is preserved separately as `source_student_identifier`; raw PDF text and coordinates remain available.
 - `coverage_complete`, `status`, `errors` and `unresolved_blocks` control whether reconciliation is permitted.
 - `grid_rows` is retained as a geometry-based compatibility view. The repaired Apps Script consumes structured shifts.
 
