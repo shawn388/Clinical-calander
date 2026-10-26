@@ -268,6 +268,7 @@ var ClinicalEngine = (() => {
     // The caller must hold the exclusive lock throughout this operation.
     for (const event of state.notifications.slice()) {
       if(env.shouldStop&&env.shouldStop()) break;
+      if(env.approvedTestDate&&(!event.shift_id||!event.shift||event.shift.date!==env.approvedTestDate)) continue;
       if(env.ownerOnly&&!event.type.startsWith('OWNER')) continue;
       if (['PREPARING','SENDING'].includes(event.status)) {
         let evidence=null;
