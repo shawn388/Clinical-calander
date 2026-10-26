@@ -89,6 +89,15 @@ test('overlapping trigger executions cannot reach ingestion or email services',(
 test('successful ingestion commits a run but never invokes dispatcher',()=>{
  const f=appContext();f.ctx.ingestClinicalCalendars();assert.equal(f.state.runs[0].status,'COMPLETED');assert.equal(f.state.sources[0].status,'APPLIED');assert.equal(f.state.notifications.length,0);
 });
+test('unchecked template checkboxes do not create student errors, but partial identities still do',()=>{
+ const f=appContext();
+ f.ss.getSheetByName('Students').getRange(3,1,2,5).setValues([['','','','',false],['Partial','','partial@example.test','Class1',false]]);
+ f.state.reviews.push({id:'old-template-error',category:'INVALID_ROSTER_ROW',source_id:'Students:3',status:'OPEN'});
+ f.ctx.ingestClinicalCalendars();
+ assert.equal(f.state.reviews.find(r=>r.id==='old-template-error').status,'RESOLVED');
+ const active=f.state.reviews.filter(r=>r.category==='INVALID_ROSTER_ROW'&&r.status==='OPEN');
+ assert.equal(active.length,1);assert.equal(active[0].source_id,'Students:4');assert.equal(f.state.students.length,1);
+});
 test('Sheets failure is recorded in the separate failure ledger without test email',()=>{
  const f=appContext({storageFailure:true});assert.throws(()=>f.ctx.ingestClinicalCalendars(),/Sheets unavailable/);
  const failures=Object.values(f.fallback).map(JSON.parse);assert.equal(failures.length,1);assert.equal(failures[0].status,'DRY_RUN');assert.equal(f.stats().released,1);
