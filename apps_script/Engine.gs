@@ -12,13 +12,20 @@ var ClinicalEngine = (() => {
   const key = (env,...parts) => env.hash(JSON.stringify(parts));
   const localDay = (now,tz) => new Intl.DateTimeFormat('en-CA',{timeZone:tz,year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(now));
 
+  function silentReview(issue,env) {
+    return issue.no_alert || ['ARCHIVED_STUDENT','LEGACY_MIGRATION_REVIEW'].includes(issue.category) ||
+      (/^\d{4}-\d{2}-\d{2}$/.test(issue.date||'') && issue.date<localDay(Math.max(env.activationAt||-Infinity,env.now),env.timezone));
+  }
+  // A moved ride must be corrected before either the original or new start.
+  const correctionCutoff = event => Math.min(ms(event.shift.start_at),event.previous?ms(event.previous.start_at):Infinity);
+
   function review(state,env,issue) {
     const id=key(env,'review',issue.dedupe_key||[issue.category,issue.source_id||'',issue.student_name||'',issue.shift_id||'',issue.date||'',issue.reason]);
     let item=state.reviews.find(r=>r.id===id);
     if (item) {
       item.last_seen=iso(env.now);item.occurrences++;
       if(item.status==='RESOLVED') {item.status='OPEN';item.cycle=(item.cycle||1)+1;
-        if(!issue.no_alert) state.notifications.push({id:key(env,'alert',id,item.cycle),type:'OWNER_EXCEPTION',review_id:id,status:'PENDING',due_at:iso(env.now),revision:item.cycle});}
+        if(!silentReview(issue,env)) state.notifications.push({id:key(env,'alert',id,item.cycle),type:'OWNER_EXCEPTION',review_id:id,status:'PENDING',due_at:iso(env.now),revision:item.cycle});}
       return item;
     }
     item=Object.assign({id,status:'OPEN',created_at:iso(env.now),last_seen:iso(env.now),occurrences:1,
@@ -27,7 +34,7 @@ var ClinicalEngine = (() => {
     if(source){item.source_pdf=source.filename;item.source_email_url='https://mail.google.com/mail/u/?authuser='+encodeURIComponent(env.owner)+'#all/'+source.message_id;
       if(source.archive_file_id)item.source_pdf_url='https://drive.google.com/file/d/'+source.archive_file_id+'/view';}
     state.reviews.push(item);
-    if (!issue.no_alert) state.notifications.push({id:key(env,'alert',id),type:'OWNER_EXCEPTION',review_id:id,status:'PENDING',due_at:iso(env.now),revision:1});
+    if (!silentReview(issue,env)) state.notifications.push({id:key(env,'alert',id),type:'OWNER_EXCEPTION',review_id:id,status:'PENDING',due_at:iso(env.now),revision:1});
     return item;
   }
 
@@ -97,7 +104,8 @@ var ClinicalEngine = (() => {
     if (state.notifications.some(n=>n.id===id)) return;
     const due=type==='SCHEDULED'?ms(shift.start_at)-24*3600000:env.now;
     const legacy=(state.legacy||[]).some(r=>r.name_normalized===norm(shift.student_name)&&r.date===shift.date&&r.location===shift.location);
-    const status=type==='SCHEDULED'&&ms(shift.start_at)<(env.activationAt||-Infinity)?'HISTORICAL':type==='SCHEDULED'&&legacy?'LEGACY_REVIEW':'PENDING';
+    const historical=type==='SCHEDULED'?ms(shift.start_at)<(env.activationAt||-Infinity):correctionCutoff({shift,previous:old})<=env.now;
+    const status=historical?'HISTORICAL':type==='SCHEDULED'&&legacy?'LEGACY_REVIEW':'PENDING';
     state.notifications.push({id,type,shift_id:shift.id,revision:shift.revision,status,due_at:iso(due),
       shift:clone(shift),previous:old?clone(old):null,to:env.to.slice(),cc:shift.student_email});
     if(status==='LEGACY_REVIEW') review(state,env,{category:'LEGACY_SEND_REVIEW',shift_id:shift.id,date:shift.date,student_name:shift.student_name,
@@ -284,7 +292,15 @@ var ClinicalEngine = (() => {
         if(attempt){attempt.status=event.status;attempt.recovered_at=iso(env.now);if(evidence)attempt.provider_message_id=evidence;}
         persist(state);
       }
-      if (!['PENDING','RETRY','DRY_RUN'].includes(event.status)||ms(event.next_retry_at||event.due_at)>env.now) continue;
+      if (!['PENDING','RETRY','DRY_RUN'].includes(event.status)) continue;
+      const ownerReview=event.type==='OWNER_EXCEPTION'?state.reviews.find(r=>r.id===event.review_id):null;
+      if(event.type==='OWNER_SUMMARY'||(ownerReview&&silentReview(ownerReview,env))) {
+        event.status='SILENT_RETAINED';event.silenced_at=iso(env.now);event.silence_reason='Owner policy: retain historical/informational records without email or summaries';delete event.preview;continue;
+      }
+      if(['CANCELLED','RESCHEDULED'].includes(event.type)&&correctionCutoff(event)<=env.now) {
+        event.status='HISTORICAL';event.silenced_at=iso(env.now);delete event.preview;continue;
+      }
+      if(ms(event.next_retry_at||event.due_at)>env.now) continue;
       if (event.type==='OWNER_EXCEPTION' && state.reviews.find(r=>r.id===event.review_id).status!=='OPEN') {event.status='SUPERSEDED';continue;}
       if (event.shift_id) {
         const current=state.shifts.find(s=>s.id===event.shift_id);
@@ -336,8 +352,6 @@ var ClinicalEngine = (() => {
       if (!latest||env.now-ms(latest.version_at)>9*86400000) review(state,env,{category:'MISSING_CALENDAR',dedupe_key:'missing_calendar_'+site,student_name:site,date:today,reason:'No accepted calendar published within nine days',instructions:'Check the weekly Platinum Planner email, label filter, attachments and failed imports; reprocess the latest verified source.'});
       else state.reviews.filter(r=>r.category==='MISSING_CALENDAR'&&r.student_name===site&&r.status==='OPEN').forEach(r=>{r.status='RESOLVED';r.resolved_at=iso(env.now);});
     });
-    const day=today,id=key(env,'summary',day);
-    if (state.reviews.some(r=>r.status==='OPEN')&&!state.notifications.some(n=>n.id===id)) state.notifications.push({id,type:'OWNER_SUMMARY',status:'PENDING',due_at:iso(env.now),revision:1});
   }
   return {init,norm,match,buildRoster,ingest,review,dispatch,monitor,tables,validateShift};
 })();
