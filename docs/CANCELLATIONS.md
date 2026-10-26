@@ -1,0 +1,17 @@
+# Platinum cancellation watchdog
+
+The five-minute notification dispatcher checks provider cancellation mail under the same script lock before releasing ride emails. It searches the last 180 days independently of the weekly-calendar label. `watchClinicalCancellations()` also permits a standalone owner-only check; no additional trigger is required.
+
+The verified format is Platinum's **Student Marked Absent** sentence, including student, exact Brewster site, date, clocks and explicit EDT/EST/CDT/CST timezone. Sender identity must be the exact provider address with aligned DKIM and DMARC passes recorded by Google's Authentication-Results header. Unknown formats and ambiguous upcoming cancellations require review. Central clocks are converted to instants before comparison with Eastern calendar rides. Other providers/sites are outside this watchdog's scope.
+
+A future cancellation requires one roster identity (including an explicitly approved alias) and an exact site/start/end match. It cancels that shift and suppresses its pending reminder. A previously notified ride receives one cancellation correction before its start. An unnotified ride sends no cancellation email. Post-start messages are historical records and send no email. A conflicting ride for the same student/date requires review instead of guessing.
+
+`RR_V2_Cancellations` retains message ID, source link, body checksum, structured scheduling fields and outcome. Personal free-text absence comments are not retained. Verified cancellations waiting for a calendar remain durable exclusions. Later weekly PDFs cannot reactivate the same student/site/start/end slot, regardless of PDF publication date. Reinstatement requires explicit owner verification and is intentionally not inferred from a stale PDF.
+
+An incomplete or failed Gmail scan holds ride email for that execution and creates a deduplicated owner failure alert. Unresolved cancellation records with status REVIEW hold upcoming reminders until resolved. Successful scans and imports stay silent. The latest 100 scan run records are retained; cancellation evidence, notification attempts and review history are retained independently.
+
+For a held identity, approve the exact alias through the existing review action; the next scan retries the message. For a demonstrably irrelevant or incorrect cancellation, enter its **cancellation record ID**, action `DISMISS_CANCELLATION`, and written evidence in RR_V2_Actions, then run `applyClinicalReviewActions()`. Dismissal resolves linked reviews. An already applied cancellation cannot be dismissed as a shortcut to reinstatement.
+
+Before production: install Engine.gs, Code.gs and Ledger.gs together in staging with TEST and LIVE_EMAIL=false; run the dispatcher; inspect cancellation outcomes, completed scan and no send attempts. Preserve the current production ledger before installing the approved commit. The existing five-minute dispatcher gains the check automatically; OAuth scopes do not change.
+
+Synthetic regression tests cover Central/Eastern conversion, unsupported formats, sender authentication, exact matching, conflicting rides, duplicate messages, pre-notice cancellation, post-notice correction, historical silence, failed-scan holds and stale-calendar exclusion. Supported production message samples must also be checked privately; do not add real student mail or comments to the public repository.
