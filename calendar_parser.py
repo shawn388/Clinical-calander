@@ -7,7 +7,7 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 import pdfplumber
 
-PARSER_VERSION = '2.0.0'
+PARSER_VERSION = '2.0.1'
 WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
 MONTHS = {datetime(2000, m, 1).strftime('%B').lower(): m for m in range(1, 13)}
 TIME = re.compile(r'^\d{1,2}:\d{2}$')
@@ -71,8 +71,17 @@ def page_calendar(page, number, filename):
     final_year = year + (final_month < first_month)
     after_allowed = date(final_year + (final_month == 12), final_month % 12 + 1, 1)
     name_window = re.search(r'-(20\d{2})(\d{2})-(20\d{2})(\d{2})\.pdf$', filename, re.I)
-    if name_window and tuple(map(int,name_window.groups())) != (year,first_month,final_year,final_month):
-        raise ParseFailure('INVALID_DATE', 'Filename and printed window disagree', page=number)
+    filename_end_semantics = 'not_supplied'
+    if name_window:
+        named = tuple(map(int,name_window.groups()))
+        if named == (year,first_month,final_year,final_month):
+            filename_end_semantics = 'inclusive_month'
+        elif named == (year,first_month,after_allowed.year,after_allowed.month):
+            # Some Planner exports name the exclusive upper-bound month.
+            # Printed dates and weekdays still determine exact coverage.
+            filename_end_semantics = 'exclusive_month'
+        else:
+            raise ParseFailure('INVALID_DATE', 'Filename and printed window disagree', page=number)
     location = next((r for r in heading.splitlines() if re.search(r'Ricky Rescue\s*-',r,re.I)), '')
     location = re.sub(r'^.*?Ricky Rescue\s*-\s*', '', location, flags=re.I)
     if not re.fullmatch(r'Brewster Ambulance Service (Lee County|Collier)', location, re.I):
@@ -178,6 +187,13 @@ def page_calendar(page, number, filename):
             if not names or residue:
                 raise ValueError('Incomplete student list; expected EMT delimiters')
             names=[n.strip(' ,;') for n in names]
+            identifiers=[]
+            for index,name in enumerate(names):
+                identifier=re.fullmatch(r'(.*?)\s+\(([A-Za-z0-9][A-Za-z0-9._-]{0,63})\)',name)
+                if identifier and any(c.isdigit() for c in identifier[2]):
+                    names[index]=identifier[1].strip();identifiers.append(identifier[2])
+                else:
+                    identifiers.append(None)
             if any(not n or not re.fullmatch(r"[\w\s,.'’\-]+",n) or re.search(r'\d',n) for n in names):
                 raise ValueError('Invalid student name')
             shift_date=weeks[anchor['week']]['dates'][anchor['col']]
@@ -190,10 +206,10 @@ def page_calendar(page, number, filename):
             for instant in (start,end):
                 if instant.replace(fold=1).utcoffset()!=instant.replace(fold=0).utcoffset():
                     raise ValueError('Ambiguous/nonexistent daylight-saving time')
-            for name in names:
+            for name,identifier in zip(names,identifiers):
                 shifts.append(dict(date=shift_date.isoformat(),start_time=start.strftime('%H:%M'),end_time=end.strftime('%H:%M'),
                                    start_at=start.isoformat(),end_at=end.isoformat(),timezone=str(ZONE),student_name=name,
-                                   location=location,source_page=number,bbox=box(block),raw_text=raw,
+                                   location=location,source_page=number,bbox=box(block),raw_text=raw,source_student_identifier=identifier,
                                    source_words=[{k:w[k] for k in ('text','x0','x1','top','bottom')} for w in block],
                                    confidence={'level':'verified','reasons':['validated_dates','time_anchor','owned_text_run','complete_student_list']}))
         except ValueError as exc:
@@ -208,7 +224,9 @@ def page_calendar(page, number, filename):
                 cols[c]+=(' ' if cols[c] else '')+w['text']
         grid_rows.append(cols)
     return shifts,errors,unresolved,dict(page=number,start=weeks[0]['dates'][0].isoformat(),end=weeks[-1]['dates'][-1].isoformat(),
-                                       location=location,column_bounds=bounds,event_card_count=len(cards)),grid_rows
+                                       location=location,column_bounds=bounds,event_card_count=len(cards),
+                                       printed_month_window=[first_allowed.strftime('%Y-%m'),date(final_year,final_month,1).strftime('%Y-%m')],
+                                       filename_end_semantics=filename_end_semantics),grid_rows
 
 def parse_pdf(data, filename=''):
     if not data or not data.startswith(b'%PDF-'):
