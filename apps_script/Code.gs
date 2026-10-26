@@ -19,7 +19,8 @@ function clinicalConfig_() {
     expectedSites:['Brewster Ambulance Service Lee County','Brewster Ambulance Service Collier']};
 }
 function clinicalHash_(value) {
-  return Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256,value).map(b=>('0'+((b+256)%256).toString(16)).slice(-2)).join('');
+  const digest=typeof value==='string'?Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256,value,Utilities.Charset.UTF_8):Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256,value);
+  return digest.map(b=>('0'+((b+256)%256).toString(16)).slice(-2)).join('');
 }
 function clinicalSession_(fn) {
   const config=clinicalConfig_(),lock=LockService.getScriptLock();
