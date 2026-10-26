@@ -74,6 +74,18 @@ function appContext(options={}){
  vm.runInContext(fs.readFileSync(__dirname+'/../apps_script/Code.gs','utf8'),ctx);
  return {ctx,state,ss,fallback,stats:()=>({released,fetches,locked})};
 }
+test('approved production test requires explicit date and disabled ordinary delivery',()=>{
+ const f=appContext(),p=f.ctx.PropertiesService.getScriptProperties().getProperties();
+ assert.throws(()=>f.ctx.dispatchClinicalApprovedTest(),/approved production test date/);
+ p.RUN_MODE='PRODUCTION';p.APPROVED_LIVE_TEST_DATE='2026-10-27';p.LIVE_EMAIL='true';
+ assert.throws(()=>f.ctx.dispatchClinicalApprovedTest(),/ordinary live delivery/);
+ p.LIVE_EMAIL='false';p.APPROVED_LIVE_TEST_DATE='2026-02-30';
+ assert.throws(()=>f.ctx.dispatchClinicalApprovedTest());
+ p.APPROVED_LIVE_TEST_DATE='2026-10-27';let observed;
+ f.ctx.clinicalSession_=fn=>fn(f.state,{liveEmail:false},{project(){},save(){}});
+ f.ctx.ClinicalEngine=Object.assign({},E,{dispatch(_s,env){observed=env;}});
+ f.ctx.dispatchClinicalApprovedTest();assert.equal(observed.liveEmail,true);assert.equal(observed.approvedTestDate,'2026-10-27');
+});
 test('Apps Script ingestion catches HTTP errors, invalid JSON and Render outages as owner reviews',()=>{
  for(const options of [{http:503},{invalidJSON:true},{outage:true}]){
   const f=appContext(options);f.ctx.ingestClinicalCalendars();assert.ok(f.state.reviews.some(r=>r.category==='PARSER_FAILURE'));
