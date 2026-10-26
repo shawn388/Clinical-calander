@@ -60,7 +60,7 @@ var ClinicalLedger = class {
     state.reviews.forEach((v,i)=>{this.reviewRows[v.id]=i+2;});this.reviewGid=r.getSheetId();
     this.projection('RR_V2_Shifts',['Shift ID','Revision','Status','Student ID','Student','Roster status','Email','Date','Start','End','Timezone','Location','Source ID'],
       state.shifts.map(s=>[s.id,s.revision,s.status,s.student_id,s.student_name,s.roster_status,s.student_email,s.date,s.start_time,s.end_time,s.timezone,s.location,s.source_id]));
-    for(const name of ['sources','extracted','history','notifications','attempts','runs','students']) {
+    for(const name of ['sources','extracted','history','notifications','attempts','runs','students','cancellations']) {
       this.projection('RR_V2_'+name[0].toUpperCase()+name.slice(1),['Record ID','JSON view (full data in committed ledger)'],
         state[name].map(r=>{const json=JSON.stringify(r);return [r.id,json.length>44000?json.slice(0,44000)+' [VIEW TRUNCATED; full record in active RR_V2_Chunks bank]':json];}));
     }
