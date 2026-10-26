@@ -69,6 +69,8 @@ For an authorized cutover:
 
 ## Rollback
 
+For a separately authorized live test while ordinary delivery remains disabled, set `APPROVED_LIVE_TEST_DATE` to the exact approved ISO shift date and run `dispatchClinicalApprovedTest()`. This entry point requires PRODUCTION mode and `LIVE_EMAIL=false`; it applies the date scope before any provider recovery or sending. Other shift dates and all owner alerts remain untouched. The regular durable due-time, recipient, identity, and duplicate guards still apply. Remove the test property after the accepted message is verified. This does not enable routine live delivery.
+
 Disable new dispatch claims first. Export the **current** ledger head, both chunk banks, review actions, registry, projections and all accepted/uncertain event IDs. Preserve the content-addressed PDF archive. Never erase notification history to restore a prior code version.
 
 The ledger stores complete state in alternating `RR_V2_Chunks_A`/`B` banks. `RR_V2_Head!A2:D2` identifies the committed digest, bank, first row and count. A failed write to the inactive bank leaves the current bank authoritative. Only restore a previous head after checksum verification and reconciling every send since that snapshot; otherwise an accepted event could be sent again. Both banks retain all logical history in their snapshots, but they are not a substitute for external backups.
