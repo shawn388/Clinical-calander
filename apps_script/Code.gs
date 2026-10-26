@@ -146,6 +146,17 @@ function clinicalTransport_() {
 function dispatchClinicalNotifications() {
   clinicalSession_((state,env,store)=>{store.project(state);ClinicalEngine.dispatch(state,env,clinicalTransport_(),s=>store.save(s));});
 }
+// A separately approved live test, while normal delivery remains disabled.
+// The engine applies the date scope before recovery, previews, or provider calls.
+function dispatchClinicalApprovedTest() {
+  const p=PropertiesService.getScriptProperties().getProperties();
+  const date=p.APPROVED_LIVE_TEST_DATE||'';
+  if(p.RUN_MODE!=='PRODUCTION'||p.LIVE_EMAIL!=='false'||!/^\d{4}-\d{2}-\d{2}$/.test(date)||new Date(date+'T00:00:00Z').toISOString().slice(0,10)!==date) throw Error('Set one explicitly approved production test date; ordinary live delivery must remain disabled');
+  clinicalSession_((state,env,store)=>{
+    const scoped=Object.assign({},env,{liveEmail:true,approvedTestDate:date});
+    store.project(state);ClinicalEngine.dispatch(state,scoped,clinicalTransport_(),s=>store.save(s));
+  });
+}
 function checkClinicalHealth() {
   clinicalSession_((state,env,store)=>{
     ClinicalEngine.monitor(state,env);store.save(state);store.project(state);
