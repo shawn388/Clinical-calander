@@ -24,6 +24,22 @@ function feed(f,shifts=[shift()],version='2026-10-10T10:00:00Z',tag='a',override
 function transport(){const t={prepared:[],sent:[],prepare(mail,id){this.prepared.push({mail,id});return id;},sendPrepared(id){this.sent.push(id);return 'message-'+id;},findAccepted(id){return this.sent.includes(id)?'message-'+id:null;}};return t;}
 function flush(f,t=transport()){let persisted=0;E.dispatch(f.state,f.env,t,()=>persisted++);return {t,persisted};}
 
+test('approved live date sends only eligible shifts on that date and remains duplicate safe',()=>{
+ const f=setup();feed(f,[shift(),shift('2026-10-19')]);
+ E.review(f.state,f.env,{category:'HISTORICAL_REVIEW',reason:'Retained owner review'});
+ f.env.approvedTestDate='2026-10-18';f.env.now=Date.parse('2026-10-18T10:00:00Z');
+ const t=transport();flush(f,t);flush(f,t);
+ assert.equal(t.sent.length,1);assert.equal(f.state.attempts.length,1);
+ assert.equal(f.state.notifications.find(n=>n.type==='OWNER_EXCEPTION').status,'PENDING');
+ assert.equal(f.state.notifications.find(n=>n.shift?.date==='2026-10-19').status,'PENDING');
+});
+test('approved live date cannot recover or send unrelated uncertain events',()=>{
+ const f=setup();feed(f);f.env.approvedTestDate='2026-10-19';
+ f.state.notifications[0].status='SENDING';
+ const t=transport();t.findAccepted=()=>{throw Error('out-of-scope recovery');};flush(f,t);
+ assert.equal(f.state.notifications[0].status,'SENDING');assert.equal(t.sent.length,0);
+});
+
 test('joins explicit roster fields; punctuation, whitespace, case, reversed names',()=>{
  const f=setup();assert.equal(E.match(' STUDENT, example ',f.roster).status,'MATCHED');assert.equal(E.match('student example',f.roster).status,'MATCHED');
  assert.equal(E.match('Example',f.roster).status,'UNMATCHED');
