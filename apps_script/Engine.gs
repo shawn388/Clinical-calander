@@ -256,11 +256,16 @@ var ClinicalEngine = (() => {
         body:open.map(r=>r.category+' | '+(r.student_name||r.source_id||r.id)+' | '+(r.date||'Unknown date')+' | '+r.reason+'\n'+env.reviewLink(r.id)+'\nResolve: '+r.instructions).join('\n\n')};
     }
     const s=event.shift;
-    return {to:event.to,cc:event.cc,subject:'Clinical Ride '+event.type+' - '+s.student_name+' - '+s.date+' '+marker,
-      body:['Hello Scheduling Team,','',event.type==='CANCELLED'?'The following clinical ride has been cancelled.':event.type==='RESCHEDULED'?'Correction: this clinical ride has been rescheduled.':'An upcoming clinical ride is scheduled.',
-        'Student: '+s.student_name,'Location: '+s.location,'Date: '+s.date,'Shift Time: '+s.start_time+' - '+s.end_time+' '+s.timezone,
-        event.previous?'Previously: '+event.previous.date+' '+event.previous.start_time+' - '+event.previous.end_time+' at '+event.previous.location:'',
-        '',"The student is CC'd. Please reply-all to confirm or coordinate arrival logistics.",'','Thank you,','Shawn','Ricky Rescue'].filter(x=>x!==null).join('\n')};
+    const location=s.location.replace(/^Brewster Ambulance Service /,''),date=s.date.slice(5,7)+'/'+s.date.slice(8,10)+'/'+s.date.slice(0,4);
+    const title=event.type==='CANCELLED'?'Cancellation':event.type==='RESCHEDULED'?'Update':'Notification';
+    const introduction=event.type==='CANCELLED'?'a cancelled clinical ride-along':event.type==='RESCHEDULED'?'a rescheduled clinical ride-along':'an upcoming clinical ride-along';
+    return {to:event.to,cc:event.cc,subject:'Clinical Ride '+title+' - '+s.student_name+' - '+date+' '+marker,
+      body:['Hello Scheduling Team,','',
+        'This is an automated notification regarding '+introduction+' at Brewster Ambulance Service ('+location+').','',
+        'Student Name: '+s.student_name,'Date: '+date,'Shift Time: '+s.start_time+' - '+s.end_time+' ('+s.timezone+')',
+        ...(event.previous?['','Previously: '+event.previous.date+' '+event.previous.start_time+' - '+event.previous.end_time+' at '+event.previous.location]:[]),
+        '',"The student has been CC'd on this email. Please reply-all to confirm or coordinate arrival logistics directly.",
+        '','Thank you,','Shawn','Ricky Rescue'].join('\n')};
   }
 
   function dispatch(state,env,transport,persist) {
