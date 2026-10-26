@@ -1,7 +1,6 @@
 from flask import Flask, request, jsonify
 import pdfplumber
 import io
-import re
 
 app = Flask(__name__)
 
@@ -20,14 +19,34 @@ def parse_calendar():
     
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
-            # Read the page visually exactly as a human sees it
-            text = page.extract_text(layout=True)
-            if text:
-                for line in text.split('\n'):
-                    # Split into columns wherever there are 2 or more consecutive spaces
-                    cols = [col.strip() for col in re.split(r' {2,}', line) if col.strip()]
-                    if cols:
-                        results.append(cols)
+            width = page.width
+            # Mathematically slice the page into 7 equal columns based on page width
+            col_width = width / 7
+            
+            # Extract words with their exact bounding boxes
+            words = page.extract_words()
+            
+            # Group words by their vertical Y-coordinate (rounding to nearest 5 pixels to group rows)
+            rows_dict = {}
+            for w in words:
+                y = round(w['top'] / 5) * 5
+                if y not in rows_dict:
+                    rows_dict[y] = []
+                rows_dict[y].append(w)
+                
+            # Sort the rows from top to bottom
+            for y in sorted(rows_dict.keys()):
+                row_words = rows_dict[y]
+                cols = ["" for _ in range(7)]
+                
+                for w in row_words:
+                    # Calculate which of the 7 columns this word falls into based on its X-coordinate
+                    col_index = min(int(w['x0'] // col_width), 6)
+                    cols[col_index] += (" " if cols[col_index] else "") + w['text']
+                
+                # Only add rows that actually have text
+                if any(cols):
+                    results.append(cols)
                         
     return jsonify({"page_count": len(pdf.pages), "grid_rows": results})
 
