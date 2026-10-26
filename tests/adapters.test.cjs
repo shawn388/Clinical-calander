@@ -65,7 +65,7 @@ function appContext(options={}){
   LockService:{getScriptLock:()=>({tryLock(){locked++;return !options.busy;},releaseLock(){released++;}})},
   SpreadsheetApp:{openById(id){assert.equal(id,'TEST');return ss;}},
   Session:{getScriptTimeZone:()=> 'America/New_York',getEffectiveUser:()=>({getEmail:()=> 'owner@example.test'})},
-  Utilities:{getUuid:()=>crypto.randomUUID(),DigestAlgorithm:{SHA_256:'sha256'},computeDigest(_alg,value){return [...crypto.createHash('sha256').update(typeof value==='string'?value:Buffer.from(value)).digest()];}},
+  Utilities:{getUuid:()=>crypto.randomUUID(),DigestAlgorithm:{SHA_256:'sha256'},Charset:{UTF_8:'UTF-8'},computeDigest(_alg,value,charset){return [...crypto.createHash('sha256').update(typeof value==='string'?(charset==='UTF-8'?value:value.replace(/[^\x00-\x7F]/g,'?')):Buffer.from(value)).digest()];}},
   GmailApp:{search(_q,start){return start===0?[{getMessages:()=>[message]}]:[];},createDraft(){throw Error('REAL MAIL FORBIDDEN');}},
   DriveApp:{getFolderById(id){assert.equal(id,'TEST_FOLDER');return {getFilesByName:()=>({hasNext:()=>false}),createFile:()=>({getId:()=> 'archive1'})};}},
   UrlFetchApp:{fetch(){fetches++;if(options.outage)throw Error('Render outage');return {getResponseCode:()=>options.http||200,getContentText:()=>options.invalidJSON?'{broken':JSON.stringify({schema_version:2,parser_version:'2',source_sha256:crypto.createHash('sha256').update(Buffer.from([1,2,3])).digest('hex'),
@@ -97,6 +97,12 @@ test('unchecked template checkboxes do not create student errors, but partial id
  assert.equal(f.state.reviews.find(r=>r.id==='old-template-error').status,'RESOLVED');
  const active=f.state.reviews.filter(r=>r.category==='INVALID_ROSTER_ROW'&&r.status==='OPEN');
  assert.equal(active.length,1);assert.equal(active[0].source_id,'Students:4');assert.equal(f.state.students.length,1);
+});
+test('Google adapter hashes Unicode strings as UTF-8 and preserves binary PDF hashes',()=>{
+ const f=appContext();
+ assert.equal(f.ctx.clinicalHash_('李明'),sha('李明'));
+ assert.notEqual(f.ctx.clinicalHash_('李明'),f.ctx.clinicalHash_('王红'));
+ assert.equal(f.ctx.clinicalHash_([0,127,-1]),crypto.createHash('sha256').update(Buffer.from([0,127,255])).digest('hex'));
 });
 test('Sheets failure is recorded in the separate failure ledger without test email',()=>{
  const f=appContext({storageFailure:true});assert.throws(()=>f.ctx.ingestClinicalCalendars(),/Sheets unavailable/);
