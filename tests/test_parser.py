@@ -50,6 +50,36 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(result['shifts'][0]['date'],'2026-11-01')
         self.assertEqual(result['coverage'][0]['end'],'2026-11-07')
 
+    def test_filename_accepts_exclusive_upper_month_but_not_arbitrary_windows(self):
+        pdf=fixture()
+        for filename,semantics in [('Calendar-202610-202611.pdf','inclusive_month'),('Calendar-202610-202612.pdf','exclusive_month')]:
+            result=parse_pdf(pdf,filename)
+            self.assertTrue(result['coverage_complete'],result['errors'])
+            self.assertEqual(result['coverage'][0]['filename_end_semantics'],semantics)
+            self.assertEqual(result['coverage'][0]['end'],'2026-11-07')
+        for filename in ['Calendar-202609-202612.pdf','Calendar-202610-202701.pdf','Calendar-202610-202610.pdf']:
+            result=parse_pdf(pdf,filename)
+            self.assertFalse(result['coverage_complete'])
+            self.assertEqual(result['errors'][0]['category'],'INVALID_DATE')
+
+    def test_exclusive_filename_month_handles_year_rollover(self):
+        result=parse_pdf(fixture(start=date(2026,11,29),heading='November - December, 2026'),'Calendar-202611-202701.pdf')
+        self.assertTrue(result['coverage_complete'],result['errors'])
+        self.assertEqual(result['coverage'][0]['filename_end_semantics'],'exclusive_month')
+
+    def test_parenthesized_account_identifier_is_preserved_separately(self):
+        result=parse_pdf(fixture(events=[{'student_lines':['Students: Example Student (user123) (EMT),','Second Person (4g7vg) (EMT)']}]))
+        self.assertTrue(result['coverage_complete'],result['errors'])
+        self.assertEqual([s['student_name'] for s in result['shifts']],['Example Student','Second Person'])
+        self.assertEqual([s['source_student_identifier'] for s in result['shifts']],['user123','4g7vg'])
+        self.assertTrue(all('user123' in s['raw_text'] for s in result['shifts']))
+
+    def test_ambiguous_parenthetical_name_suffix_stays_held(self):
+        for suffix in ['(Nickname)','(account123) (other456)','(123) Extra']:
+            result=parse_pdf(fixture(events=[{'student_lines':['Student: Example Student '+suffix+' (EMT)']}]))
+            self.assertFalse(result['coverage_complete'])
+            self.assertEqual(result['errors'][0]['category'],'LOW_CONFIDENCE')
+
     def test_cross_year_explicit_january_midweek(self):
         result=parse_pdf(fixture(start=date(2026,12,27),heading='December - January, 2026',events=[{'col':5}]))
         self.assertTrue(result['coverage_complete'],result['errors'])
