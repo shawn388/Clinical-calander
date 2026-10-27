@@ -66,7 +66,7 @@ function appContext(options={}){
   SpreadsheetApp:{openById(id){assert.equal(id,'TEST');return ss;}},
   Session:{getScriptTimeZone:()=> 'America/New_York',getEffectiveUser:()=>({getEmail:()=> 'owner@example.test'})},
   Utilities:{getUuid:()=>crypto.randomUUID(),DigestAlgorithm:{SHA_256:'sha256'},Charset:{UTF_8:'UTF-8'},computeDigest(_alg,value,charset){return [...crypto.createHash('sha256').update(typeof value==='string'?(charset==='UTF-8'?value:value.replace(/[^\x00-\x7F]/g,'?')):Buffer.from(value)).digest()];}},
-  GmailApp:{search(_q,start){return start===0?[{getMessages:()=>[message]}]:[];},createDraft(){throw Error('REAL MAIL FORBIDDEN');}},
+  GmailApp:{search(q,start){if(q.includes('marked themselves absent')) {if(options.cancellationOutage)throw Error('Gmail unavailable');return start===0&&options.cancellationMessage?[{getMessages:()=>[options.cancellationMessage]}]:[];}return start===0?[{getMessages:()=>[message]}]:[];},createDraft(){throw Error('REAL MAIL FORBIDDEN');}},
   DriveApp:{getFolderById(id){assert.equal(id,'TEST_FOLDER');return {getFilesByName:()=>({hasNext:()=>false}),createFile:()=>({getId:()=> 'archive1'})};}},
   UrlFetchApp:{fetch(){fetches++;if(options.outage)throw Error('Render outage');return {getResponseCode:()=>options.http||200,getContentText:()=>options.invalidJSON?'{broken':JSON.stringify({schema_version:2,parser_version:'2',source_sha256:crypto.createHash('sha256').update(Buffer.from([1,2,3])).digest('hex'),
    generated_at:'2026-10-17T08:00:00-04:00',coverage:[{location:'Brewster Ambulance Service Lee County',start:'2026-10-18',end:'2026-11-21'}],coverage_complete:true,status:'complete',shifts:[],errors:[],unresolved_blocks:[]})};}}
@@ -125,4 +125,21 @@ test('legacy migration preserves raw rows and does not promote pending queue ite
  f.ss.insertSheet('Manual_Email_Queue').getRange(1,1,2,5).setValues([['Status','Shift Date','Student Name','Location','Email'],['APPROVED','10/19/2026','Example Student','Lee County','student@example.test']]);
  f.ctx.stageClinicalLegacyHistory();assert.equal(f.state.legacy.length,2);assert.equal(f.state.legacy[1].state,'LEGACY_REVIEW_ONLY');assert.equal(f.state.shifts.length,0);
  assert.equal(f.state.legacy[0].date,'2026-10-18');assert.equal(f.state.legacy[1].date,'');
+});
+
+test('cancellation authentication trusts Google aligned results and exact provider sender',()=>{
+ const f=appContext(),auth='Authentication-Results: mx.google.com; dkim=pass header.i=@platinumed.com;\r\n dmarc=pass header.from=platinumed.com\r\n\r\nBody';
+ assert.equal(f.ctx.clinicalCancellationAuthenticated_(auth,'Platinum Planner <donotreply@platinumed.com>'),true);
+ for(const [raw,from] of [[auth,'fake-donotreply@platinumed.com'],[auth.replace('dmarc=pass','dmarc=fail'),'donotreply@platinumed.com'],[auth.replace('mx.google.com','untrusted.example'),'donotreply@platinumed.com'],['Subject: test\r\n\r\n'+auth,'donotreply@platinumed.com']]) assert.equal(f.ctx.clinicalCancellationAuthenticated_(raw,from),false);
+});
+test('regular dispatcher checks cancellation messages first under the same lock',()=>{
+ const message={getId:()=> 'absence1',getFrom:()=> 'Platinum Planner <donotreply@platinumed.com>',getDate:()=>new Date('2026-10-26T12:00:00Z'),getPlainBody:()=>"Example Student (Student) has marked themselves absent for 'Brewster Ambulance Service: Lee County Station' on 10/28/2099 from 07:00 until 19:00 CDT. Comments: private",getRawContent:()=> 'Authentication-Results: mx.google.com; dkim=pass header.i=@platinumed.com; dmarc=pass header.from=platinumed.com\r\n\r\nbody'};
+ const f=appContext({cancellationMessage:message});let called=false;
+ f.ctx.ClinicalEngine={...E,dispatch(state,env){called=true;assert.equal(state.cancellations[0].status,'WAITING_FOR_CALENDAR');assert.equal(env.ownerOnly,undefined);assert.equal(f.stats().released,0);}};
+ f.ctx.dispatchClinicalNotifications();assert.equal(called,true);assert.equal(f.stats().released,1);assert.ok(f.state.runs.some(r=>r.type==='CANCELLATION_WATCHDOG'&&r.status==='COMPLETED'));
+});
+test('Gmail cancellation scan failure holds ride mail and leaves an actionable failure',()=>{
+ const f=appContext({cancellationOutage:true});let called=false;
+ f.ctx.ClinicalEngine={...E,dispatch(state,env){called=true;assert.equal(env.ownerOnly,true);assert.ok(state.reviews.some(r=>r.category==='CANCELLATION_WATCHDOG_FAILURE'));}};
+ f.ctx.dispatchClinicalNotifications();assert.equal(called,true);assert.ok(f.state.runs.some(r=>r.status==='FAILED'));assert.equal(f.stats().released,1);
 });

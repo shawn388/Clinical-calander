@@ -68,4 +68,6 @@ Sending has durable PREPARING/SENDING/API_ACCEPTED states, with a script-wide lo
 
 Owner exception events include category, student/PDF identifier, affected date, reason, review-row link and resolution instructions. Recurring open issues deduplicate. Historical and informational reviews remain in the ledger without email; daily summaries and success emails are disabled. Queued legacy summary/informational events become SILENT_RETAINED without resolving their reviews or altering accepted/uncertain send evidence. The independent watchdog can deliver owner alerts without sending student notices. A small Script Properties failure ledger covers failures of the Sheets ledger itself.
 
+The five-minute dispatcher also checks Platinum cancellation mail before releasing ride reminders. Verified absence messages create durable exclusions that override stale weekly PDFs. Ambiguous cancellations or a failed scan hold reminders and alert the owner. See [the cancellation watchdog guide](docs/CANCELLATIONS.md) for supported formats and review actions.
+
 See the deployment runbook before installing any `.gs` files, configuring properties, or creating triggers.

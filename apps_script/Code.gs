@@ -143,8 +143,54 @@ function clinicalTransport_() {
     }
   };
 }
+function clinicalCancellationAuthenticated_(raw,from) {
+  if(!/^(?:"?Platinum Planner"?\s*<)?donotreply@platinumed\.com>?$/i.test(String(from).trim())) return false;
+  const headers=String(raw).split(/\r?\n\r?\n/,1)[0].replace(/\r?\n[ \t]+/g,' ');
+  const trusted=headers.split(/\r?\n/).find(line=>/^Authentication-Results:\s*mx\.google\.com;/i.test(line));
+  return Boolean(trusted&&/\bdkim=pass\b/i.test(trusted)&&/\bheader\.i=@platinumed\.com\b/i.test(trusted)&&/\bdmarc=pass\b/i.test(trusted)&&/\bheader\.from=platinumed\.com\b/i.test(trusted));
+}
+function clinicalCancellationScan_(state,env,store,ss) {
+  const roster=clinicalRoster_(ss,state,env),run={id:Utilities.getUuid(),type:'CANCELLATION_WATCHDOG',started_at:new Date().toISOString(),status:'RUNNING'};
+  let retained=0;
+  state.runs=state.runs.slice().reverse().filter(r=>r.type!=='CANCELLATION_WATCHDOG'||++retained<100).reverse();
+  state.runs.push(run);store.save(state);
+  const query='from:donotreply@platinumed.com newer_than:180d {"marked themselves absent" "clinical cancelled" "clinical canceled" "shift cancelled" "shift canceled" "has been cancelled" "has been canceled"}';
+  try {
+    for(let offset=0;;offset+=20) {
+      if(env.shouldStop()) throw Error('Cancellation scan exceeded execution budget; reminders held until a full scan completes');
+      const threads=GmailApp.search(query,offset,20);
+      if(!threads.length) break;
+      for(const thread of threads) for(const message of thread.getMessages()) {
+        if(env.shouldStop()) throw Error('Cancellation scan exceeded execution budget; reminders held until a full scan completes');
+        if(state.cancellations.some(c=>c.message_id===message.getId()&&c.status!=='REVIEW')) continue;
+        if(!String(message.getFrom()).toLowerCase().includes('donotreply@platinumed.com')) continue;
+        const body=message.getPlainBody();
+        // Thread search can also return calendars, approvals and unrelated sites.
+        if(!/Brewster Ambulance Service/i.test(body)||!/(?:marked themselves absent|clinical cancel(?:led|ed)|shift cancel(?:led|ed)|has been cancel(?:led|ed))/i.test(body)) continue;
+        ClinicalEngine.ingestCancellation(state,env,{id:message.getId(),received_at:message.getDate().toISOString(),body,
+          authenticated:clinicalCancellationAuthenticated_(message.getRawContent(),message.getFrom())},roster);
+      }
+      store.save(state);
+    }
+    run.status='COMPLETED';run.ended_at=new Date().toISOString();state.cancellation_scan_at=run.ended_at;
+    state.reviews.filter(r=>r.category==='CANCELLATION_WATCHDOG_FAILURE'&&r.status==='OPEN').forEach(r=>{r.status='RESOLVED';r.resolved_at=run.ended_at;});
+    store.save(state);return true;
+  } catch(error) {
+    run.status='FAILED';run.ended_at=new Date().toISOString();run.error=String(error);
+    ClinicalEngine.review(state,env,{category:'CANCELLATION_WATCHDOG_FAILURE',dedupe_key:'cancellation_watchdog_failure',reason:'Cannot complete Platinum cancellation check; upcoming reminders are held. '+String(error),instructions:'Inspect Gmail access and Apps Script executions. Restore the cancellation scan and verify a completed CANCELLATION_WATCHDOG run before releasing reminders.'});
+    store.save(state);return false;
+  }
+}
+function watchClinicalCancellations() {
+  clinicalSession_((state,env,store,ss)=>{clinicalCancellationScan_(state,env,store,ss);store.project(state);
+    ClinicalEngine.dispatch(state,Object.assign({},env,{ownerOnly:true}),clinicalTransport_(),s=>store.save(s));});
+}
 function dispatchClinicalNotifications() {
-  clinicalSession_((state,env,store)=>{store.project(state);ClinicalEngine.dispatch(state,env,clinicalTransport_(),s=>store.save(s));});
+  clinicalSession_((state,env,store,ss)=>{
+    const complete=clinicalCancellationScan_(state,env,store,ss);store.project(state);
+    env.now=Date.now();
+    ClinicalEngine.dispatch(state,complete?env:Object.assign({},env,{ownerOnly:true}),clinicalTransport_(),s=>store.save(s));
+  });
 }
 // A separately approved live test, while normal delivery remains disabled.
 // The engine applies the date scope before recovery, previews, or provider calls.
@@ -185,6 +231,12 @@ function applyClinicalReviewActions() {
         }
         else if(action==='RESOLVE_REVIEW'&&r) {r.status='RESOLVED';r.resolution=String(evidence);r.resolved_at=new Date().toISOString();}
         else if(action==='REPROCESS_SOURCE'&&state.sources.some(s=>s.id===id)) {state.sources.find(s=>s.id===id).status='REVIEW';}
+        else if(action==='DISMISS_CANCELLATION'&&state.cancellations.some(c=>c.id===id)) {
+          const c=state.cancellations.find(c=>c.id===id);
+          if(c.status==='APPLIED') throw Error('An applied cancellation requires an explicitly verified reinstatement; dismissal cannot reactivate it');
+          c.status='DISMISSED';c.resolution=String(evidence);c.resolved_at=new Date().toISOString();
+          state.reviews.filter(r=>r.source_id===id&&r.status==='OPEN').forEach(r=>{r.status='RESOLVED';r.resolution=String(evidence);r.resolved_at=c.resolved_at;});
+        }
         else if(n&&['UNCERTAIN','LEGACY_REVIEW'].includes(n.status)&&action==='CONFIRM_ACCEPTED') {n.status='API_ACCEPTED';n.accepted_at=new Date().toISOString();n.manual_evidence=String(evidence);}
         else if(n&&['UNCERTAIN','LEGACY_REVIEW'].includes(n.status)&&action==='CONFIRM_NOT_SENT') {n.status='RETRY';n.next_retry_at=new Date().toISOString();n.manual_evidence=String(evidence);}
         else throw Error('Invalid action or record state: '+action);

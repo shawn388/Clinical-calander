@@ -1,7 +1,7 @@
 /* Pure scheduling logic. No Google services; all effects use injected adapters. */
 var ClinicalEngine = (() => {
   'use strict';
-  const tables = ['sources','extracted','shifts','history','notifications','attempts','reviews','runs','students'];
+  const tables = ['sources','extracted','shifts','history','notifications','attempts','reviews','runs','students','cancellations'];
   const clone = x => JSON.parse(JSON.stringify(x));
   const norm = x => String(x || '').normalize('NFKD').replace(/[\u0300-\u036f]/g,'').toLowerCase()
     .replace(/[’']/g,'').replace(/[^\p{L}\p{N}]+/gu,' ').trim().replace(/\s+/g,' ');
@@ -120,6 +120,65 @@ var ClinicalEngine = (() => {
     state.notifications.filter(n=>n.shift_id===id && ['PENDING','RETRY','DRY_RUN'].includes(n.status)).forEach(n=>n.status='SUPERSEDED');
   }
 
+  function parseCancellation(body) {
+    const text=String(body||'').replace(/\r\n?/g,'\n');
+    const pattern=/(?:^|\n)([^\n]+?) \(Student\) has marked themselves absent for '([^'\n]+)' on (\d{1,2})\/(\d{1,2})\/(\d{4}) from (\d{2}:\d{2}) until (\d{2}:\d{2}) (EDT|EST|CDT|CST)\.(?=\s*(?:Comments:|$))/g;
+    const matches=[...text.matchAll(pattern)];
+    if(matches.length!==1) throw Error('Unsupported or multiple cancellation statements; verify the original Platinum message');
+    const m=matches[0],sites={'Brewster Ambulance Service: Lee County Station':'Brewster Ambulance Service Lee County','Brewster Ambulance Service: Collier':'Brewster Ambulance Service Collier'};
+    if(!sites[m[2]]) {if(!/^Brewster Ambulance Service/i.test(m[2])) return {ignored:true};throw Error('Unrecognized Brewster site');}
+    const date=m[5]+'-'+m[3].padStart(2,'0')+'-'+m[4].padStart(2,'0'),check=new Date(date+'T00:00:00Z');
+    if(!Number.isFinite(check.getTime())||check.toISOString().slice(0,10)!==date) throw Error('Invalid cancellation date');
+    if(![m[6],m[7]].every(t=>/^([01]\d|2[0-3]):[0-5]\d$/.test(t))) throw Error('Invalid cancellation clock time');
+    const offset={EDT:'-04:00',EST:'-05:00',CDT:'-05:00',CST:'-06:00'}[m[8]];
+    const start=ms(date+'T'+m[6]+':00'+offset);
+    let end=ms(date+'T'+m[7]+':00'+offset);if(end<=start) end+=86400000;
+    // Preserve the explicit provider offset; compare instants, never clock labels.
+    return {student_name:m[1].trim(),location:sites[m[2]],date:localDay(start,'America/New_York'),start_at:iso(start),end_at:iso(end),provider_timezone:m[8]};
+  }
+  const cancelledSlot = (state,shift) => state.cancellations.some(c=>c.student_id===shift.student_id&&c.location===shift.location&&
+    ['APPLIED','WAITING_FOR_CALENDAR'].includes(c.status)&&ms(c.start_at)===ms(shift.start_at)&&ms(c.end_at)===ms(shift.end_at));
+
+  function ingestCancellation(state,env,message,roster) {
+    init(state);
+    let record=state.cancellations.find(c=>c.message_id===message.id);
+    if(record&&record.status!=='REVIEW') return record;
+    const sourceUrl='https://mail.google.com/mail/u/?authuser='+encodeURIComponent(env.owner)+'#all/'+message.id;
+    if(!record) {record={id:key(env,'cancellation',message.id),message_id:message.id,body_sha256:env.hash(message.body),received_at:message.received_at,source_email_url:sourceUrl,status:'REVIEW'};state.cancellations.push(record);}
+    try {
+      if(!message.authenticated) throw Error('Sender authentication could not be verified');
+      const parsed=parseCancellation(message.body);
+      if(parsed.ignored) {record.status='OUTSIDE_PROGRAM';return record;}
+      Object.assign(record,parsed);
+      // A post-start absence changes history only and cannot create an alert.
+      if(ms(parsed.start_at)<=env.now) {
+        record.status='HISTORICAL';
+        state.reviews.filter(r=>r.source_id===record.id&&r.status==='OPEN').forEach(r=>{r.status='RESOLVED';r.resolved_at=iso(env.now);r.resolution='Ride already started; retained without notification';});
+        return record;
+      }
+      const identity=match(parsed.student_name,roster,state.aliases||[]);
+      if(identity.status!=='MATCHED') throw Error('Cancellation student identity is '+identity.status.toLowerCase());
+      record.student_id=identity.student.id;
+      const candidates=state.shifts.filter(s=>s.status==='ACTIVE'&&s.student_id===record.student_id&&s.location===parsed.location&&ms(s.start_at)===ms(parsed.start_at)&&ms(s.end_at)===ms(parsed.end_at));
+      if(candidates.length>1) throw Error('Multiple active shifts match the cancellation');
+      if(!candidates.length&&state.shifts.some(s=>s.status==='ACTIVE'&&s.student_id===record.student_id&&s.date===parsed.date)) throw Error('Student has a ride on this date but site or times differ; verify the exact cancelled slot');
+      record.status=candidates.length?'APPLIED':'WAITING_FOR_CALENDAR';record.verified_at=iso(env.now);
+      for(const shift of candidates) {
+        const previous=clone(shift),sent=previouslyNotified(state,shift.id)||state.notifications.some(n=>n.shift_id===shift.id&&['UNCERTAIN','LEGACY_REVIEW','PREPARING','SENDING'].includes(n.status));
+        suppress(state,shift.id);shift.status='CANCELLED';shift.revision++;shift.cancellation_id=record.id;
+        state.history.push({id:key(env,'email-cancel',record.id,shift.id),shift_id:shift.id,type:'CANCELLED',previous,next:clone(shift),at:iso(env.now),cancellation_id:record.id});
+        if(sent) notification(state,env,shift,'CANCELLED',previous);
+      }
+      state.reviews.filter(r=>r.source_id===record.id&&r.status==='OPEN').forEach(r=>{r.status='RESOLVED';r.resolved_at=iso(env.now);r.resolution='Verified cancellation matched deterministically';});
+    } catch(error) {
+      // Old unsupported messages are kept without flooding historical alerts.
+      record.status=ms(message.received_at)<(env.activationAt||-Infinity)?'HISTORICAL_UNPARSED':'REVIEW';record.reason=String(error);
+      if(record.status==='REVIEW') review(state,env,{category:'CANCELLATION_REVIEW',source_id:record.id,source_email_url:sourceUrl,
+        student_name:record.student_name,date:record.date,reason:record.reason,instructions:'Inspect the original Platinum message. Correct an approved student alias and retry, or dismiss this cancellation with documented evidence. Upcoming reminders are held until unresolved cancellation reviews are cleared.'});
+    }
+    return record;
+  }
+
   function reconcileSiteChanges(state,env) {
     // Exact student/start/end evidence can link a verified cancellation at one
     // site to an addition at another. Calendars must share a publication day.
@@ -127,7 +186,7 @@ var ClinicalEngine = (() => {
     for(const old of state.shifts.filter(s=>s.status==='CANCELLED')) {
       const cancelled=state.history.filter(h=>h.shift_id===old.id&&h.type==='CANCELLED').slice(-1)[0];
       const source=state.sources.find(s=>s.id===old.source_id&&s.status==='APPLIED');
-      if(!cancelled||!source) continue;
+      if(!cancelled||!source||old.cancellation_id) continue;
       const candidates=active.filter(s=>s.student_id===old.student_id&&s.start_at===old.start_at&&s.end_at===old.end_at&&s.location!==old.location&&
         state.sources.some(src=>src.id===s.source_id&&src.status==='APPLIED'&&src.version_at.slice(0,10)===source.version_at.slice(0,10)));
       if(candidates.length!==1) continue;
@@ -196,7 +255,7 @@ var ClinicalEngine = (() => {
     if (conflict) {review(state,env,{category:'SOURCE_CONFLICT',source_id:id,reason:'Conflicting content has the same published version; owner must determine authority'});return {status:'REVIEW',source_id:id};}
     const authoritative = shift => !state.sources.some(s=>s.id!==id&&s.status==='APPLIED'&&s.complete&&ms(s.version_at)>ms(src.version_at)&&covered(s,shift));
     const old=state.shifts.filter(s=>s.status==='ACTIVE'&&covered(src,s)&&authoritative(s));
-    const incoming=matched.filter(authoritative);
+    const incoming=matched.filter(s=>authoritative(s)&&!cancelledSlot(state,s));
     const fingerprint=s=>key(env,s.student_id,s.location,s.start_at,s.end_at);
     const newKeys=new Set(incoming.map(fingerprint));
     if (newKeys.size!==incoming.length) {review(state,env,{category:'DUPLICATE_SHIFT',source_id:id,reason:'Duplicate student/time/site observations'});return {status:'REVIEW',source_id:id};}
@@ -305,6 +364,7 @@ var ClinicalEngine = (() => {
       if (event.shift_id) {
         const current=state.shifts.find(s=>s.id===event.shift_id);
         if (!current||current.revision!==event.revision || (event.type==='SCHEDULED'&&current.status!=='ACTIVE')) {event.status='SUPERSEDED';continue;}
+        if(event.type==='SCHEDULED'&&state.cancellations.some(c=>c.status==='REVIEW')) continue;
         if(state.notifications.some(n=>n.id!==event.id&&n.shift_id===event.shift_id&&['UNCERTAIN','LEGACY_REVIEW','PREPARING','SENDING'].includes(n.status))) {
           review(state,env,{category:'PRIOR_NOTIFICATION_UNCERTAIN',shift_id:event.shift_id,date:event.shift.date,student_name:event.shift.student_name,
             reason:'Resolve prior uncertain notification evidence before releasing event '+event.id});continue;
@@ -353,6 +413,6 @@ var ClinicalEngine = (() => {
       else state.reviews.filter(r=>r.category==='MISSING_CALENDAR'&&r.student_name===site&&r.status==='OPEN').forEach(r=>{r.status='RESOLVED';r.resolved_at=iso(env.now);});
     });
   }
-  return {init,norm,match,buildRoster,ingest,review,dispatch,monitor,tables,validateShift};
+  return {init,norm,match,buildRoster,ingest,review,dispatch,monitor,tables,validateShift,parseCancellation,ingestCancellation};
 })();
 if (typeof module!=='undefined') module.exports=ClinicalEngine;
