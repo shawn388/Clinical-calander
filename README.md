@@ -56,16 +56,16 @@ Complete supported calendars return 200, review-required/invalid PDFs return 422
 
 ## Behavior
 
-Roster reads use explicit headers. Matching accepts a unique normalized full name, a controlled reversed name, or an explicitly approved alias to one Student ID. It does not accept shared first-name tokens. Active and archived records remain distinct; archived matches produce owner flags. Missing names, duplicate identities, invalid emails and malformed roster rows create reviews.
+Roster reads use explicit headers. Matching accepts a unique normalized full name, a controlled reversed name, or an explicitly approved alias to one Student ID. It does not accept shared first-name tokens. Active and archived records remain distinct; archived matches retain silent review records. Missing names, duplicate identities, invalid emails and malformed roster rows create reviews.
 
 Sources retain message/attachment identity, content hash and printed publication time. Older calendars cannot overwrite newer covered dates, including dates newer calendars show empty. Equal-publication conflicting content requires review. Incomplete imports and imports with unresolved identities preserve the prior schedule. Dates outside a rolling window are not cancelled.
 
-One-to-one changes for a student/site retain a shift ID and produce reschedule history. Exact student/start/end evidence can also link a verified site cancellation/addition published on the same day. Ambiguous many-to-many changes require review. Previously notified changes generate correction events with prior and current details.
+One-to-one changes for a student/site retain a shift ID and produce reschedule history. Exact student/start/end evidence can also link a verified site cancellation/addition published on the same day. Ambiguous many-to-many changes require review. Previously notified changes generate correction events with prior and current details only before the earlier of the original and revised ride start. Later changes remain in history without email.
 
 Notifications are due 24 **elapsed hours** before the shift. This deliberately handles daylight-saving offsets; it can differ from the same local clock time on the previous day. A configurable cutover timestamp suppresses historical backfill. Already-started unsent shifts are surfaced as missed notifications. Due upcoming shifts discovered late are eligible immediately.
 
 Sending has durable PREPARING/SENDING/API_ACCEPTED states, with a script-wide lock. Draft-creation failures retry with backoff. Unknown send outcomes remain UNCERTAIN; the next run searches Sent evidence rather than blindly resending. API acceptance is never labelled recipient delivery. Test mode never creates a draft or sends email.
 
-Owner exception events include category, student/PDF identifier, affected date, reason, review-row link and resolution instructions. Recurring open issues deduplicate; the health job prepares a daily unresolved summary. The independent watchdog can deliver owner alerts without sending student notices. A small Script Properties failure ledger covers failures of the Sheets ledger itself.
+Owner exception events include category, student/PDF identifier, affected date, reason, review-row link and resolution instructions. Recurring open issues deduplicate. Historical and informational reviews remain in the ledger without email; daily summaries and success emails are disabled. Queued legacy summary/informational events become SILENT_RETAINED without resolving their reviews or altering accepted/uncertain send evidence. The independent watchdog can deliver owner alerts without sending student notices. A small Script Properties failure ledger covers failures of the Sheets ledger itself.
 
 See the deployment runbook before installing any `.gs` files, configuring properties, or creating triggers.

@@ -51,9 +51,10 @@ test('duplicate names across active/archive never overwrite one another',()=>{
  assert.equal(E.match('Example Student',f.roster).status,'AMBIGUOUS');feed(f);
  assert.equal(f.state.shifts.length,0);assert.ok(f.state.reviews.some(r=>r.category==='AMBIGUOUS_STUDENT'));
 });
-test('confident archived match stays eligible and flags owner',()=>{
+test('confident archived match stays eligible and retains a silent review',()=>{
  const f=setup();f.roster[0].status='ARCHIVED';feed(f);assert.equal(f.state.shifts.length,1);
  assert.ok(f.state.reviews.some(r=>r.category==='ARCHIVED_STUDENT'&&!r.blocking));
+ assert.equal(f.state.notifications.filter(n=>n.type==='OWNER_EXCEPTION').length,0);
 });
 test('unmatched and missing-email entries persist with actionable owner events',()=>{
  const f=setup();feed(f,[shift('2026-10-18','Unknown Person')]);assert.equal(f.state.extracted.length,1);
@@ -151,9 +152,9 @@ test('owner alerts include category, identity, date, link, and resolution',()=>{
  assert.ok(t.sent.length>0);const mail=t.prepared[0].mail;for(const text of ['Category:','Student/PDF:','Shift date:','Reason:','Review record: https://','Resolve:']) assert.ok(mail.body.includes(text));
  assert.deepEqual(mail.to,['owner@example.test']);
 });
-test('watchdog deduplicates recurring alerts and creates one daily summary',()=>{
+test('health monitor deduplicates failure alerts without creating daily summaries',()=>{
  const f=setup();E.monitor(f.state,f.env);const alerts=f.state.notifications.length;E.monitor(f.state,f.env);assert.equal(f.state.notifications.length,alerts);
- f.env.now+=86400000;E.monitor(f.state,f.env);assert.equal(f.state.notifications.filter(n=>n.type==='OWNER_EXCEPTION').length,2);assert.equal(f.state.notifications.filter(n=>n.type==='OWNER_SUMMARY').length,2);
+ f.env.now+=86400000;E.monitor(f.state,f.env);assert.equal(f.state.notifications.filter(n=>n.type==='OWNER_EXCEPTION').length,2);assert.equal(f.state.notifications.filter(n=>n.type==='OWNER_SUMMARY').length,0);
 });
 test('watchdog can send owner alerts independently without sending shift notices',()=>{
  const f=setup();feed(f);E.monitor(f.state,f.env);f.env.ownerOnly=true;const {t}=flush(f);assert.ok(t.sent.length>0);assert.equal(f.state.notifications[0].status,'PENDING');
@@ -227,8 +228,44 @@ test('reschedule corrections wait for resolution of a prior uncertain send',()=>
  const correction=f.state.notifications.find(n=>n.type==='RESCHEDULED');assert.ok(correction);
  const next=transport();flush(f,next);assert.ok(next.prepared.every(p=>p.mail.to[0]==='owner@example.test'));assert.equal(correction.status,'PENDING');
 });
-test('a verified correction to a previously notified shift is not discarded after its date',()=>{
+test('a correction discovered after the original ride starts is retained without email',()=>{
  const f=setup();feed(f);const t=transport();flush(f,t);f.env.now=Date.parse('2026-10-20T12:00:00Z');
  feed(f,[shift('2026-10-19')],'2026-10-20T10:00:00Z','late-correction');flush(f,t);
- assert.equal(t.sent.length,2);assert.equal(f.state.notifications.find(n=>n.type==='RESCHEDULED').status,'API_ACCEPTED');
+ assert.equal(t.sent.length,1);assert.equal(f.state.notifications.find(n=>n.type==='RESCHEDULED').status,'HISTORICAL');
+});
+
+
+test('queued corrections expire at the earlier original or revised ride start',()=>{
+ for(const cancel of [true,false]) {
+  const f=setup();feed(f);const t=transport();flush(f,t);
+  feed(f,cancel?[]:[shift('2026-10-19')],'2026-10-17T11:00:00Z','revision');
+  const event=f.state.notifications.find(n=>n.type===(cancel?'CANCELLED':'RESCHEDULED'));
+  assert.equal(event.status,'PENDING');
+  f.env.now=Date.parse('2026-10-18T12:00:00Z');flush(f,t);
+  assert.equal(t.sent.length,1);assert.equal(event.status,'HISTORICAL');
+ }
+});
+test('old summary and informational queues are silenced without resolving their records',()=>{
+ const f=setup();
+ for(const category of ['ARCHIVED_STUDENT','LEGACY_MIGRATION_REVIEW']) {
+  const r=E.review(f.state,f.env,{category,reason:'Historical evidence retained'});
+  f.state.notifications.push({id:category,type:'OWNER_EXCEPTION',review_id:r.id,status:'DRY_RUN',due_at:new Date(f.env.now).toISOString()});
+ }
+ f.state.notifications.push({id:'old-summary',type:'OWNER_SUMMARY',status:'PENDING',due_at:new Date(f.env.now+86400000).toISOString()});
+ const {t}=flush(f);assert.equal(t.sent.length,0);assert.equal(f.state.attempts.length,0);
+ assert.ok(f.state.notifications.every(n=>n.status==='SILENT_RETAINED'));
+ assert.ok(f.state.reviews.every(r=>r.status==='OPEN'));
+});
+test('historical dated issues stay quiet while current operational failures alert',()=>{
+ const f=setup();E.review(f.state,f.env,{category:'UNMATCHED_STUDENT',date:'2026-10-01',reason:'Old source'});
+ E.review(f.state,f.env,{category:'PARSER_FAILURE',reason:'Parser unreachable'});
+ const {t}=flush(f);assert.equal(t.sent.length,1);assert.match(t.prepared[0].mail.subject,/PARSER_FAILURE/);
+ assert.equal(f.state.reviews.length,2);
+});
+test('past corrections recover accepted send evidence before applying quiet policy',()=>{
+ const f=setup();feed(f);const t=transport();flush(f,t);
+ feed(f,[],'2026-10-17T11:00:00Z','cancel');
+ const event=f.state.notifications.find(n=>n.type==='CANCELLED');
+ event.status='SENDING';t.sent.push(event.id);f.env.now=Date.parse('2026-10-19T12:00:00Z');
+ flush(f,t);assert.equal(event.status,'API_ACCEPTED');assert.equal(t.sent.length,2);
 });
