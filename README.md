@@ -70,4 +70,6 @@ Owner exception events include category, student/PDF identifier, affected date, 
 
 The five-minute dispatcher also checks Platinum cancellation mail before releasing ride reminders. Verified absence messages create durable exclusions that override stale weekly PDFs. Ambiguous cancellations or a failed scan hold reminders and alert the owner. See [the cancellation watchdog guide](docs/CANCELLATIONS.md) for supported formats and review actions.
 
+See [the reliability guide](docs/RELIABILITY.md) for incremental Gmail scanning, changed-only spreadsheet views, safe read retries and the independent lightweight health monitor.
+
 See the deployment runbook before installing any `.gs` files, configuring properties, or creating triggers.
