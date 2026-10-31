@@ -1,6 +1,6 @@
 # Platinum cancellation watchdog
 
-The five-minute notification dispatcher checks provider cancellation mail under the same script lock before releasing ride emails. It searches the last 180 days independently of the weekly-calendar label. `watchClinicalCancellations()` also permits a standalone owner-only check; no additional trigger is required.
+The five-minute notification dispatcher checks provider cancellation mail under the same script lock before releasing ride emails. It searches independently of the weekly-calendar label: a full 180-day reconciliation initially and daily, with a 48-hour overlapping checkpoint window between full scans. `watchClinicalCancellations()` also permits a standalone owner-only check; no additional trigger is required.
 
 The verified format is Platinum's **Student Marked Absent** sentence, including student, exact Brewster site, date, clocks and explicit EDT/EST/CDT/CST timezone. Sender identity must be the exact provider address with aligned DKIM and DMARC passes recorded by Google's Authentication-Results header. Unknown formats and ambiguous upcoming cancellations require review. Central clocks are converted to instants before comparison with Eastern calendar rides. Other providers/sites are outside this watchdog's scope.
 
@@ -8,7 +8,7 @@ A future cancellation requires one roster identity (including an explicitly appr
 
 `RR_V2_Cancellations` retains message ID, source link, body checksum, structured scheduling fields and outcome. Personal free-text absence comments are not retained. Verified cancellations waiting for a calendar remain durable exclusions. Later weekly PDFs cannot reactivate the same student/site/start/end slot, regardless of PDF publication date. Reinstatement requires explicit owner verification and is intentionally not inferred from a stale PDF.
 
-An incomplete or failed Gmail scan holds ride email for that execution and creates a deduplicated owner failure alert. Unresolved cancellation records with status REVIEW hold upcoming reminders until resolved. Successful scans and imports stay silent. The latest 100 scan run records are retained; cancellation evidence, notification attempts and review history are retained independently.
+An incomplete or failed Gmail scan holds ride email for that execution and creates a deduplicated owner failure alert. Unresolved cancellation records with status REVIEW hold upcoming reminders until resolved. Successful scans and imports stay silent. The latest 100 significant scan journal records (full scans, business changes or failures) are retained; quiet successes use a small Script Properties heartbeat. Cancellation evidence, notification attempts and review history are retained independently. See [the reliability guide](RELIABILITY.md).
 
 For a held identity, approve the exact alias through the existing review action; the next scan retries the message. For a demonstrably irrelevant or incorrect cancellation, enter its **cancellation record ID**, action `DISMISS_CANCELLATION`, and written evidence in RR_V2_Actions, then run `applyClinicalReviewActions()`. Dismissal resolves linked reviews. An already applied cancellation cannot be dismissed as a shortcut to reinstatement.
 

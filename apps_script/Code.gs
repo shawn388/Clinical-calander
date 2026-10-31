@@ -13,7 +13,7 @@ function clinicalConfig_() {
   if(p.RUN_MODE==='TEST'&&p.PARSER_URL==='https://clinical-calander.onrender.com/parse-calendar') throw Error('Test jobs require a separate parser service');
   const to=(p.NOTIFICATION_TO||'').split(',').map(v=>v.trim()).filter(Boolean);
   if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(p.OWNER_EMAIL||'')||!to.length||to.some(v=>! /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v))) throw Error('Set verified OWNER_EMAIL and comma-separated NOTIFICATION_TO');
-  return {sheet:p.SPREADSHEET_ID,url:p.PARSER_URL,token:p.PARSER_API_TOKEN,folder:p.ARCHIVE_FOLDER_ID,
+  return {mode:p.RUN_MODE,sheet:p.SPREADSHEET_ID,url:p.PARSER_URL,token:p.PARSER_API_TOKEN,folder:p.ARCHIVE_FOLDER_ID,
     liveEmail:p.LIVE_EMAIL==='true',activationAt:Date.parse(p.NOTIFICATIONS_FROM),gmailQuery:'label:platinum-planner newer_than:180d',timezone:'America/New_York',owner:p.OWNER_EMAIL,
     to:to,
     expectedSites:['Brewster Ambulance Service Lee County','Brewster Ambulance Service Collier']};
@@ -22,20 +22,72 @@ function clinicalHash_(value) {
   const digest=typeof value==='string'?Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256,value,Utilities.Charset.UTF_8):Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256,value);
   return digest.map(b=>('0'+((b+256)%256).toString(16)).slice(-2)).join('');
 }
-function clinicalSession_(fn) {
-  const config=clinicalConfig_(),lock=LockService.getScriptLock();
-  if(!lock.tryLock(5000)) {Logger.log('Another clinical job holds the lock; next scheduled execution will retry.');return;}
+function clinicalJSON_(text,fallback) {
+  try {const value=JSON.parse(text||'null');return value&&typeof value==='object'?value:fallback;} catch(_e) {return fallback;}
+}
+// Read retries only. Never wrap ledger commits, draft creation or email sending.
+function clinicalRead_(label,fn,context) {
+  for(let attempt=0;;attempt++) {
+    if(context&&context.stage)context.stage(label);
+    try {return fn();} catch(error) {
+      if(attempt>=2||!/(server error|temporar|internal error|unavailable|timed out|timeout|\b(?:429|502|503)\b)/i.test(String(error))||
+        (context&&context.shouldStop&&context.shouldStop())) throw error;
+      if(context&&context.retry)context.retry(label);
+      Utilities.sleep(attempt?750:250);
+    }
+  }
+}
+function clinicalSession_(fn,kind='GENERAL') {
+  const props=PropertiesService.getScriptProperties(),diagKey='RR_DIAG_'+kind;
+  const prior=clinicalJSON_(props.getProperty(diagKey),{}),started=Date.now(),deadline=started+240000;
+  const diag=Object.assign({},prior,{run_id:Utilities.getUuid(),started_at:new Date(started).toISOString(),stage:'CONFIG',status:'RUNNING',read_retries:0});
+  const stage=value=>{diag.stage=value;diag.stage_at=new Date().toISOString();props.setProperty(diagKey,JSON.stringify(diag));};
+  const context={stage,shouldStop:()=>Date.now()>deadline,retry:()=>{diag.read_retries++;}};
+  let config,lock,acquired=false;
   try {
-    const ss=SpreadsheetApp.openById(config.sheet);
+    stage('CONFIG');config=clinicalConfig_();lock=LockService.getScriptLock();stage('LOCK');
+    if(!lock.tryLock(5000)) {diag.status='SKIPPED_LOCK';stage('SKIPPED_LOCK');return;}
+    acquired=true;
+    const ss=clinicalRead_('WORKBOOK_OPEN',()=>SpreadsheetApp.openById(config.sheet),context);
     if(ss.getSpreadsheetTimeZone()!=='America/New_York'||Session.getScriptTimeZone()!=='America/New_York') throw Error('Workbook and script must use America/New_York');
-    const store=new ClinicalLedger(ss,clinicalHash_),state=store.load();
-    const deadline=Date.now()+240000;
-    const env=Object.assign({},config,{now:Date.now(),hash:clinicalHash_,reviewLink:id=>store.reviewLink(id),shouldStop:()=>Date.now()>deadline,
+    const cache=clinicalJSON_(props.getProperty('RR_VIEW_HASHES'),{});
+    const priorHashes=JSON.stringify(cache.hashes||{});
+    const store=new ClinicalLedger(ss,clinicalHash_,{projectionHashes:cache.hashes||{},stage,read:(label,read)=>clinicalRead_(label,read,context)});
+    stage('LEDGER_LOAD');const state=store.load();
+    const env=Object.assign({},config,context,{props,now:Date.now(),hash:clinicalHash_,
+      read:(label,read)=>clinicalRead_(label,read,context),reviewLink:id=>store.reviewLink(id,state),
       dayKey:now=>Utilities.formatDate(new Date(now),'America/New_York','yyyy-MM-dd')});
-    try {fn(state,env,store,ss);}
-    finally {store.save(state);store.project(state);}
-  } catch(error) {clinicalFallbackAlert_(config,error);throw error;}
-  finally {lock.releaseLock();}
+    let outcome,processingError;
+    try {stage('PROCESS');outcome=fn(state,env,store,ss);}
+    catch(error) {processingError=error;diag.failed_stage=diag.stage;}
+    try {
+      store.save(state);stage('VIEWS');
+      const fullAt=Date.parse(cache.full_at||cache.at||'');
+      const force=env.forceViews||!Number.isFinite(fullAt)||Date.now()-fullAt>=86400000;
+      store.project(state,force);
+      const nextHashes=JSON.stringify(store.projectionHashes||{});
+      if(force||nextHashes!==priorHashes) props.setProperty('RR_VIEW_HASHES',JSON.stringify({at:new Date().toISOString(),full_at:force?new Date().toISOString():(cache.full_at||cache.at),hashes:store.projectionHashes||{}}));
+    } catch(error) {if(processingError){diag.finalization_error=String(error).slice(0,1000);throw processingError;}throw error;}
+    if(processingError)throw processingError;
+    diag.status=outcome===false?'HELD':'COMPLETED';diag.ended_at=new Date().toISOString();
+    if(outcome!==false) {diag.last_success_at=diag.ended_at;diag.consecutive_failures=0;delete diag.error;delete diag.failed_stage;delete diag.finalization_error;}
+    else diag.consecutive_failures=(prior.consecutive_failures||0)+1;
+    if(kind==='DISPATCH') {
+      const pending=state.notifications.filter(n=>['PENDING','RETRY','DRY_RUN'].includes(n.status)&&n.type==='SCHEDULED');
+      diag.next_due_at=pending.length?pending.map(n=>n.next_retry_at||n.due_at).sort()[0]:null;
+      diag.uncertain_count=state.notifications.filter(n=>['UNCERTAIN','SENDING','PREPARING'].includes(n.status)).length;
+    }
+    const completedImports=state.runs.filter(r=>r.type==='INGEST'&&r.status==='COMPLETED').map(r=>r.ended_at).filter(Boolean).sort();
+    const scheduleHealth={ingest_success_at:completedImports.slice(-1)[0]||null,sites:config.expectedSites.map(site=>({site,
+      published_at:state.sources.filter(s=>s.status==='APPLIED'&&s.coverage.some(c=>c.location===site)).map(s=>s.version_at).filter(Boolean).sort().slice(-1)[0]||null}))};
+    const healthText=JSON.stringify(scheduleHealth);
+    if(props.getProperty('RR_SCHEDULE_HEALTH')!==healthText)props.setProperty('RR_SCHEDULE_HEALTH',healthText);
+    stage(diag.status);
+  } catch(error) {
+    diag.status='FAILED';diag.failed_stage=diag.failed_stage||diag.stage;diag.error=String(error).slice(0,1000);diag.ended_at=new Date().toISOString();
+    diag.consecutive_failures=(prior.consecutive_failures||0)+1;stage('FAILED');
+    if(config)clinicalFallbackAlert_(config,error);throw error;
+  } finally {if(acquired)lock.releaseLock();}
 }
 function clinicalFallbackAlert_(config,error) {
   // Separate small failure ledger when the Sheets ledger itself is unavailable.
@@ -61,8 +113,8 @@ function clinicalFallbackAlert_(config,error) {
 function clinicalRoster_(ss,state,env) {
   const rows=[];
   for(const tab of ['Students','Archive']) {
-    const sheet=ss.getSheetByName(tab);if(!sheet) throw Error('Missing roster tab '+tab);
-    const values=sheet.getDataRange().getValues(),headers=values[0].map(String);
+    const sheet=env.read?env.read('ROSTER_LOOKUP',()=>ss.getSheetByName(tab)):ss.getSheetByName(tab);if(!sheet) throw Error('Missing roster tab '+tab);
+    const values=env.read?env.read('ROSTER_READ',()=>sheet.getDataRange().getValues()):sheet.getDataRange().getValues(),headers=values[0].map(String);
     const idx={};for(const name of ['First Name','Last Name','Email','Cohort/Class #']) {
       const matches=headers.map((h,i)=>h.trim()===name?i:-1).filter(i=>i>=0);
       if(matches.length!==1) throw Error('Expected one explicit header '+name+' in '+tab);idx[name]=matches[0];
@@ -92,10 +144,10 @@ function ingestClinicalCalendars() {
       const roster=clinicalRoster_(ss,state,env);
       let offset=state.gmail_offset||0,finished=false;
       while(Date.now()-started<220000) {
-        const threads=GmailApp.search(env.gmailQuery,offset,20);
+        const threads=env.read('CALENDAR_SEARCH',()=>GmailApp.search(env.gmailQuery,offset,20));
         if(!threads.length) {finished=true;break;}
         // Complete a thread page before advancing the checkpoint. Replay is safe.
-        for(const thread of threads) for(const message of thread.getMessages()) {
+        for(const thread of threads) for(const message of env.read('CALENDAR_THREAD',()=>thread.getMessages())) {
           if(!/Calendar.*Brewster/i.test(message.getSubject())||!String(message.getFrom()).includes('donotreply@platinumed.com')) continue;
           const attachments=message.getAttachments({includeInlineImages:false});let calendars=0;
           for(let index=0;index<attachments.length;index++) {
@@ -129,16 +181,20 @@ function ingestClinicalCalendars() {
       if(finished) state.gmail_offset=0;
       run.status=finished?'COMPLETED':'CONTINUATION';run.ended_at=new Date().toISOString();
     } catch(e) {run.status='FAILED';run.ended_at=new Date().toISOString();ClinicalEngine.review(state,env,{category:'INGEST_FAILURE',source_id:run.id,reason:String(e)});}
-  });
+    return run.status==='COMPLETED';
+  },'INGEST');
 }
-function clinicalTransport_() {
+function clinicalTransport_(env) {
   return {
-    prepare(mail) {return GmailApp.createDraft(mail.to.join(','),mail.subject,mail.body,mail.cc?{cc:mail.cc}:{}).getId();},
-    sendPrepared(id) {return GmailApp.getDraft(id).send().getId();},
+    prepare(mail) {if(env&&env.stage)env.stage('EMAIL_DRAFT_PREPARE');return GmailApp.createDraft(mail.to.join(','),mail.subject,mail.body,mail.cc?{cc:mail.cc}:{}).getId();},
+    sendPrepared(id) {
+      const draft=env&&env.read?env.read('EMAIL_DRAFT_READ',()=>GmailApp.getDraft(id)):GmailApp.getDraft(id);
+      if(env&&env.stage)env.stage('EMAIL_SEND');return draft.send().getId();
+    },
     findAccepted(id) {
       const marker='[RR:'+id+']';
       const owner=Session.getEffectiveUser().getEmail();
-      for(const t of GmailApp.search('in:sent from:me "'+marker+'"',0,20)) for(const m of t.getMessages()) if(m.getSubject().includes(marker)&&m.getFrom().includes(owner)) return m.getId();
+      for(const t of (env&&env.read?env.read('SENT_EVIDENCE',()=>GmailApp.search('in:sent from:me "'+marker+'"',0,20)):GmailApp.search('in:sent from:me "'+marker+'"',0,20))) for(const m of t.getMessages()) if(m.getSubject().includes(marker)&&m.getFrom().includes(owner)) return m.getId();
       return null;
     }
   };
@@ -150,47 +206,61 @@ function clinicalCancellationAuthenticated_(raw,from) {
   return Boolean(trusted&&/\bdkim=pass\b/i.test(trusted)&&/\bheader\.i=@platinumed\.com\b/i.test(trusted)&&/\bdmarc=pass\b/i.test(trusted)&&/\bheader\.from=platinumed\.com\b/i.test(trusted));
 }
 function clinicalCancellationScan_(state,env,store,ss) {
-  const roster=clinicalRoster_(ss,state,env),run={id:Utilities.getUuid(),type:'CANCELLATION_WATCHDOG',started_at:new Date().toISOString(),status:'RUNNING'};
-  let retained=0;
-  state.runs=state.runs.slice().reverse().filter(r=>r.type!=='CANCELLATION_WATCHDOG'||++retained<100).reverse();
-  state.runs.push(run);store.save(state);
-  const query='from:donotreply@platinumed.com newer_than:180d {"marked themselves absent" "clinical cancelled" "clinical canceled" "shift cancelled" "shift canceled" "has been cancelled" "has been canceled"}';
+  const props=env.props||PropertiesService.getScriptProperties(),cursor=clinicalJSON_(props.getProperty('RR_CANCEL_CURSOR'),{});
+  const now=Date.now(),since=Date.parse(cursor.last_success_at||''),lastFull=Date.parse(cursor.last_full_at||'');
+  const full=!Number.isFinite(since)||since>now||!Number.isFinite(lastFull)||lastFull>now||now-lastFull>=86400000;
+  const window=full||!Number.isFinite(since)?'newer_than:180d':'after:'+Math.floor((since-48*3600000)/1000);
+  const query='from:donotreply@platinumed.com '+window+' {"marked themselves absent" "clinical cancelled" "clinical canceled" "shift cancelled" "shift canceled" "has been cancelled" "has been canceled"}';
+  const before=env.hash(JSON.stringify(state)),roster=clinicalRoster_(ss,state,env);
+  const run={id:Utilities.getUuid(),type:'CANCELLATION_WATCHDOG',started_at:new Date(now).toISOString(),scan_mode:full?'FULL':'RECENT',status:'RUNNING'};
+  const seen=new Set(Array.isArray(cursor.seen_ids)?cursor.seen_ids.filter(id=>typeof id==='string'):[]),read=env.read||((_label,fn)=>fn());
   try {
     for(let offset=0;;offset+=20) {
       if(env.shouldStop()) throw Error('Cancellation scan exceeded execution budget; reminders held until a full scan completes');
-      const threads=GmailApp.search(query,offset,20);
+      const threads=read('CANCELLATION_SEARCH',()=>GmailApp.search(query,offset,20));
       if(!threads.length) break;
-      for(const thread of threads) for(const message of thread.getMessages()) {
+      for(const thread of threads) for(const message of read('CANCELLATION_THREAD',()=>thread.getMessages())) {
         if(env.shouldStop()) throw Error('Cancellation scan exceeded execution budget; reminders held until a full scan completes');
-        if(state.cancellations.some(c=>c.message_id===message.getId()&&c.status!=='REVIEW')) continue;
-        if(!String(message.getFrom()).toLowerCase().includes('donotreply@platinumed.com')) continue;
-        const body=message.getPlainBody();
-        // Thread search can also return calendars, approvals and unrelated sites.
-        if(!/Brewster Ambulance Service/i.test(body)||!/(?:marked themselves absent|clinical cancel(?:led|ed)|shift cancel(?:led|ed)|has been cancel(?:led|ed))/i.test(body)) continue;
-        ClinicalEngine.ingestCancellation(state,env,{id:message.getId(),received_at:message.getDate().toISOString(),body,
-          authenticated:clinicalCancellationAuthenticated_(message.getRawContent(),message.getFrom())},roster);
+        const id=message.getId(),known=state.cancellations.find(c=>c.message_id===id);
+        if(known&&known.status!=='REVIEW') continue;
+        if(!known&&seen.has(id)) continue;
+        if(!String(message.getFrom()).toLowerCase().includes('donotreply@platinumed.com')) {seen.add(id);continue;}
+        const body=read('CANCELLATION_BODY',()=>message.getPlainBody());
+        if(!/Brewster Ambulance Service/i.test(body)||!/(?:marked themselves absent|clinical cancel(?:led|ed)|shift cancel(?:led|ed)|has been cancel(?:led|ed))/i.test(body)) {seen.add(id);continue;}
+        ClinicalEngine.ingestCancellation(state,env,{id,received_at:message.getDate().toISOString(),body,
+          authenticated:clinicalCancellationAuthenticated_(read('CANCELLATION_AUTH',()=>message.getRawContent()),message.getFrom())},roster);
       }
-      store.save(state);
     }
-    run.status='COMPLETED';run.ended_at=new Date().toISOString();state.cancellation_scan_at=run.ended_at;
+    run.status='COMPLETED';run.ended_at=new Date().toISOString();
     state.reviews.filter(r=>r.category==='CANCELLATION_WATCHDOG_FAILURE'&&r.status==='OPEN').forEach(r=>{r.status='RESOLVED';r.resolved_at=run.ended_at;});
-    store.save(state);return true;
+    if(full||env.hash(JSON.stringify(state))!==before) {
+      let retained=0;state.runs=state.runs.slice().reverse().filter(r=>r.type!=='CANCELLATION_WATCHDOG'||++retained<100).reverse();
+      state.runs.push(run);state.cancellation_scan_at=run.ended_at;
+    }
+    // Advance only after all business changes are durably committed. Failed
+    // scans retain the previous cursor and seen set, so retries cannot skip mail.
+    store.save(state);
+    props.setProperty('RR_CANCEL_CURSOR',JSON.stringify({last_success_at:run.ended_at,last_full_at:full?run.ended_at:cursor.last_full_at,
+      scans:(cursor.scans||0)+1,seen_ids:Array.from(seen).slice(-200)}));
+    return true;
   } catch(error) {
     run.status='FAILED';run.ended_at=new Date().toISOString();run.error=String(error);
-    ClinicalEngine.review(state,env,{category:'CANCELLATION_WATCHDOG_FAILURE',dedupe_key:'cancellation_watchdog_failure',reason:'Cannot complete Platinum cancellation check; upcoming reminders are held. '+String(error),instructions:'Inspect Gmail access and Apps Script executions. Restore the cancellation scan and verify a completed CANCELLATION_WATCHDOG run before releasing reminders.'});
+    let retained=0;state.runs=state.runs.slice().reverse().filter(r=>r.type!=='CANCELLATION_WATCHDOG'||++retained<100).reverse();state.runs.push(run);
+    ClinicalEngine.review(state,env,{category:'CANCELLATION_WATCHDOG_FAILURE',dedupe_key:'cancellation_watchdog_failure',reason:'Cannot complete Platinum cancellation check; upcoming reminders are held. '+String(error),instructions:'Inspect Gmail access and Apps Script executions. Restore the cancellation scan and verify its RR_CANCEL_CURSOR and RR_DIAG_DISPATCH success timestamps before releasing reminders.'});
     store.save(state);return false;
   }
 }
 function watchClinicalCancellations() {
-  clinicalSession_((state,env,store,ss)=>{clinicalCancellationScan_(state,env,store,ss);store.project(state);
-    ClinicalEngine.dispatch(state,Object.assign({},env,{ownerOnly:true}),clinicalTransport_(),s=>store.save(s));});
+  clinicalSession_((state,env,store,ss)=>{clinicalCancellationScan_(state,env,store,ss);
+    ClinicalEngine.dispatch(state,Object.assign({},env,{ownerOnly:true}),clinicalTransport_(env),s=>store.save(s));},'CANCELLATIONS');
 }
 function dispatchClinicalNotifications() {
   clinicalSession_((state,env,store,ss)=>{
-    const complete=clinicalCancellationScan_(state,env,store,ss);store.project(state);
+    const complete=clinicalCancellationScan_(state,env,store,ss);
     env.now=Date.now();
-    ClinicalEngine.dispatch(state,complete?env:Object.assign({},env,{ownerOnly:true}),clinicalTransport_(),s=>store.save(s));
-  });
+    ClinicalEngine.dispatch(state,complete?env:Object.assign({},env,{ownerOnly:true}),clinicalTransport_(env),s=>store.save(s));
+    return complete;
+  },'DISPATCH');
 }
 // A separately approved live test, while normal delivery remains disabled.
 // The engine applies the date scope before recovery, previews, or provider calls.
@@ -200,16 +270,72 @@ function dispatchClinicalApprovedTest() {
   if(p.RUN_MODE!=='PRODUCTION'||p.LIVE_EMAIL!=='false'||!/^\d{4}-\d{2}-\d{2}$/.test(date)||new Date(date+'T00:00:00Z').toISOString().slice(0,10)!==date) throw Error('Set one explicitly approved production test date; ordinary live delivery must remain disabled');
   clinicalSession_((state,env,store)=>{
     const scoped=Object.assign({},env,{liveEmail:true,approvedTestDate:date});
-    store.project(state);ClinicalEngine.dispatch(state,scoped,clinicalTransport_(),s=>store.save(s));
+    ClinicalEngine.dispatch(state,scoped,clinicalTransport_(),s=>store.save(s));
   });
 }
 function checkClinicalHealth() {
   clinicalSession_((state,env,store)=>{
-    ClinicalEngine.monitor(state,env);store.save(state);store.project(state);
+    ClinicalEngine.monitor(state,env);store.save(state);
     // Independent watchdog can deliver owner alerts even if the ordinary shift
     // dispatcher is absent; it never sends student scheduling notifications.
-    ClinicalEngine.dispatch(state,Object.assign({},env,{ownerOnly:true}),clinicalTransport_(),s=>store.save(s));
-  });
+    ClinicalEngine.dispatch(state,Object.assign({},env,{ownerOnly:true}),clinicalTransport_(env),s=>store.save(s));
+  },'HEALTH');
+}
+// Separate trigger: reads only small Script Properties heartbeats. It remains
+// useful when dispatch or Sheets fails; Google-wide outages still need Google's
+// native failure notifications. Never sends student mail or retries a send.
+function checkClinicalDeliveryHealth() {
+  // A distinct lock lets monitoring run even if dispatch holds the script lock.
+  const lock=LockService.getUserLock();if(!lock.tryLock(1000))return {status:'SKIPPED_LOCK'};
+  try {return clinicalDeliveryHealth_(clinicalConfig_(),PropertiesService.getScriptProperties(),Date.now());}
+  finally {lock.releaseLock();}
+}
+function clinicalDeliveryHealth_(config,props,now) {
+  const dispatch=clinicalJSON_(props.getProperty('RR_DIAG_DISPATCH'),{}),scan=clinicalJSON_(props.getProperty('RR_CANCEL_CURSOR'),{});
+  const schedule=clinicalJSON_(props.getProperty('RR_SCHEDULE_HEALTH'),{});
+  const old=clinicalJSON_(props.getProperty('RR_DELIVERY_HEALTH'),{});
+  const age=value=>{const t=Date.parse(value||'');return Number.isFinite(t)?now-t:Infinity;};
+  const issues=[];
+  if(age(dispatch.last_success_at)>15*60000) issues.push('No successful reminder dispatcher within 15 minutes');
+  if(age(scan.last_success_at)>15*60000) issues.push('No successful cancellation check within 15 minutes');
+  if(dispatch.next_due_at&&age(dispatch.next_due_at)>10*60000) issues.push('A pending reminder is more than 10 minutes overdue');
+  if(age(schedule.ingest_success_at)>26*3600000)issues.push('No completed calendar ingestion within 26 hours');
+  for(const site of config.expectedSites) {
+    const source=(schedule.sites||[]).find(s=>s.site===site);
+    if(!source||age(source.published_at)>9*86400000)issues.push('No accepted calendar within nine days for '+site);
+  }
+  const diagnostic={checked_at:new Date(now).toISOString(),status:issues.length?'ATTENTION':'HEALTHY',issues,
+    dispatch_success_at:dispatch.last_success_at||null,cancellation_success_at:scan.last_success_at||null,dispatch_stage:dispatch.failed_stage||dispatch.stage||'NO_HEARTBEAT'};
+  props.setProperty('RR_DIAG_DELIVERY_HEALTH',JSON.stringify(diagnostic));
+  if(!issues.length) {
+    if(old.status&&old.status!=='RESOLVED') props.setProperty('RR_DELIVERY_HEALTH',JSON.stringify(Object.assign({},old,{status:'RESOLVED',resolved_at:diagnostic.checked_at})));
+    return diagnostic;
+  }
+  // A deliberate production maintenance pause is quiet; TEST still records a
+  // dry-run incident so the complete alert path can be rehearsed safely.
+  if(config.mode==='PRODUCTION'&&!config.liveEmail) return diagnostic;
+  if(['PREPARING','SENDING','API_ACCEPTED','UNCERTAIN'].includes(old.status)||(old.status==='DRY_RUN'&&!config.liveEmail)) return diagnostic;
+  const cycle=(old.cycle||0)+1,id=clinicalHash_('delivery-health:'+cycle+':'+diagnostic.checked_at);
+  const record={id,cycle,status:config.liveEmail?'PREPARING':'DRY_RUN',opened_at:diagnostic.checked_at,issues,
+    previous_message_id:old.message_id||old.previous_message_id||null};
+  props.setProperty('RR_DELIVERY_HEALTH',JSON.stringify(record));
+  if(!config.liveEmail)return diagnostic;
+  try {
+    const subject='Clinical scheduler needs attention [RR-HEALTH:'+id+']';
+    const body=['Clinical scheduling requires attention.','',...issues,
+      'Last successful dispatcher: '+(diagnostic.dispatch_success_at||'None recorded'),
+      'Last successful cancellation scan: '+(diagnostic.cancellation_success_at||'None recorded'),
+      'Latest dispatcher stage: '+diagnostic.dispatch_stage,
+      'Workbook: https://docs.google.com/spreadsheets/d/'+config.sheet+'/edit',
+      'Resolve: Inspect Apps Script executions and RR_DIAG_DISPATCH / RR_CANCEL_CURSOR. Restore the failing job and verify the next due reminder. Inspect Sent mail before releasing uncertain notifications.'].join('\n');
+    const draft=GmailApp.createDraft(config.owner,subject,body);record.draft_id=draft.getId();record.status='SENDING';
+    props.setProperty('RR_DELIVERY_HEALTH',JSON.stringify(record));
+    record.message_id=draft.send().getId();record.status='API_ACCEPTED';props.setProperty('RR_DELIVERY_HEALTH',JSON.stringify(record));
+  } catch(error) {record.status='UNCERTAIN';record.error=String(error).slice(0,1000);props.setProperty('RR_DELIVERY_HEALTH',JSON.stringify(record));throw error;}
+  return diagnostic;
+}
+function refreshClinicalViews() {
+  clinicalSession_((_state,env)=>{env.forceViews=true;},'VIEWS');
 }
 function applyClinicalReviewActions() {
   clinicalSession_((state,env,store,ss)=>{
