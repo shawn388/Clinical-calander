@@ -2,19 +2,11 @@
 
 Status: application attribution remains unproven; do not submit a claim of a confirmed Google defect. This packet is a draft for an authorized owner support request, not a report already filed.
 
-## Verified October 31 incident supplied by owner
+## Incident handling
 
-Timezone: America/New_York (EDT, UTC-04 on October 31, 2026).
+Keep exact production timestamps, execution identifiers, ledger checksums/counts, accepted-send evidence, pending-due times and source-audit details in private owner evidence. Do not publish them in a public PR or issue without authorization. The original release emitted no application ENTRY/phase console records and later successful runs overwrote its latest diagnostic property. That evidence cannot distinguish failure before application entry, during initial property access, or later.
 
-- `dispatchClinicalNotifications` time-driven start: 2026-10-31 13:17:54 EDT (17:17:54 UTC).
-- Failed at 13:49:54 EDT (17:49:54 UTC), reported duration 1920.187 seconds.
-- Visible Cloud log: generic Google server error, no source line or stack.
-- Subsequent 13:22:54 dispatch completed in 6.8 seconds; later scheduled dispatchers also completed.
-- Independent health jobs at 13:19:09, 13:29:09, 13:39:09 and 13:49:09 completed.
-- The reminder had already been accepted in Gmail Sent at 09:03:57 EDT. Do not resend it to investigate this failure.
-- PR5 was useful but did not eliminate the recurrence. The old release had no application ENTRY/phase console records, and later successful runs overwrote its diagnostic property. The old evidence cannot distinguish failure before application entry, during initial property access, or later.
-
-The project identifiers and accepted-send message/event identifiers remain in private owner evidence and the task handoff. Do not attach student data, source PDFs, raw ledger snapshots, properties, tokens, addresses or message bodies to a public issue.
+Do not attach student data, source PDFs, raw ledger snapshots, properties, tokens, addresses or message bodies to a public issue. Do not resend an accepted notification to investigate an execution failure.
 
 ## Add for a recurrence on the candidate release
 
@@ -27,7 +19,7 @@ The project identifiers and accepted-send message/event identifiers remain in pr
 ## Questions for Google support
 
 - Does backend execution telemetry identify the last completed runtime/service operation for this execution?
-- Does the 1920-second duration include queue/startup time, logging delay or an execution whose service call never returned?
+- Does the reported duration include queue/startup time, logging delay or an execution whose service call never returned?
 - Is there an internal platform error identifier unavailable in the generic Apps Script error?
 - If ENTRY is absent on the candidate but surrounding controls log normally, can Google distinguish failure before application execution from console/Cloud Logging ingestion failure?
 
