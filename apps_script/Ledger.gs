@@ -5,6 +5,7 @@
  */
 var ClinicalLedger = class {
   constructor(spreadsheet,hash,options={}) {this.ss=spreadsheet;this.hash=hash;this.digest=null;this.bank=null;this.reviewRows={};this.options=options;this.projectionHashes=options.projectionHashes||{};}
+  op(label,fn) {return this.options.op?this.options.op(label,fn):fn();}
   read(label,fn) {return this.options.read?this.options.read(label,fn):fn();}
   sheet(name,headers) {
     let sheet=this.read('SHEET_LOOKUP',()=>this.ss.getSheetByName(name));
@@ -22,11 +23,12 @@ var ClinicalLedger = class {
     if(chunks.some((r,i)=>r[0]!==digest||r[1]!==i)) throw Error('Incomplete ledger snapshot');
     if(chunks.some(r=>!String(r[2]).startsWith('J:'))) throw Error('Invalid ledger fragment encoding');
     const serialized=chunks.map(r=>r[2].slice(2)).join('');
-    if(this.hash(serialized)!==digest) throw Error('Ledger snapshot checksum mismatch');
+    if(this.op('LEDGER_CHECKSUM',()=>this.hash(serialized))!==digest) throw Error('Ledger snapshot checksum mismatch');
     this.digest=digest;this.bank=bank;
     return ClinicalEngine.init(JSON.parse(serialized));
   }
-  save(state) {
+  save(state) {return this.op('LEDGER_COMMIT',()=>this.saveSnapshot(state));}
+  saveSnapshot(state) {
     const serialized=JSON.stringify(state),digest=this.hash(serialized);
     if(digest===this.digest) return false;
     if(this.options.stage)this.options.stage('LEDGER_COMMIT');
@@ -39,15 +41,15 @@ var ClinicalLedger = class {
     const bank=this.bank==='RR_V2_Chunks_A'?'RR_V2_Chunks_B':'RR_V2_Chunks_A';
     const sheet=this.sheet(bank,['Snapshot SHA256','Index','JSON fragment']);
     if(this.options.stage)this.options.stage('LEDGER_BANK_WRITE');
-    sheet.clearContents();sheet.getRange(1,1,1,3).setValues([['Snapshot SHA256','Index','JSON fragment']]);
+    this.op('LEDGER_BANK_CLEAR',()=>{sheet.clearContents();sheet.getRange(1,1,1,3).setValues([['Snapshot SHA256','Index','JSON fragment']]);});
     const start=2;
     this.ensure(sheet,start+chunks.length-1);
-    sheet.getRange(start,1,chunks.length,3).setValues(chunks);
-    SpreadsheetApp.flush();
+    this.op('LEDGER_BANK_WRITE',()=>sheet.getRange(start,1,chunks.length,3).setValues(chunks));
+    this.op('LEDGER_BANK_FLUSH',()=>SpreadsheetApp.flush());
     const head=this.sheet('RR_V2_Head',['SHA256','Bank','First chunk row','Chunk count']);
     if(this.options.stage)this.options.stage('LEDGER_HEAD_WRITE');
-    head.getRange(2,1,1,4).setValues([[digest,bank,start,chunks.length]]);
-    SpreadsheetApp.flush();
+    this.op('LEDGER_HEAD_WRITE',()=>head.getRange(2,1,1,4).setValues([[digest,bank,start,chunks.length]]));
+    this.op('LEDGER_HEAD_FLUSH',()=>SpreadsheetApp.flush());
     this.digest=digest;this.bank=bank;return true;
   }
   projection(name,headers,rows) {
@@ -59,8 +61,8 @@ var ClinicalLedger = class {
     }));
     this.ensure(sheet,safe.length+1);
     if(this.options.stage)this.options.stage('VIEW_WRITE:'+name);
-    sheet.clearContents();sheet.getRange(1,1,1,headers.length).setValues([headers]);
-    if(safe.length) sheet.getRange(2,1,safe.length,headers.length).setValues(safe);
+    this.op('VIEW_WRITE:'+name,()=>{sheet.clearContents();sheet.getRange(1,1,1,headers.length).setValues([headers]);
+      if(safe.length) sheet.getRange(2,1,safe.length,headers.length).setValues(safe);});
     this.projectionHashes[name]=digest;return sheet;
   }
   project(state,force=false) {

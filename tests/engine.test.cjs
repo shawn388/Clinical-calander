@@ -185,7 +185,7 @@ test('real tracker snapshot matches names via explicit fields in local-only inte
 test('configuration refuses production workbook or live email in TEST mode',()=>{
  const text=fs.readFileSync(require('node:path').resolve(__dirname,'../apps_script/Code.gs'),'utf8');
  const p={RUN_MODE:'TEST',SPREADSHEET_ID:'synthetic-production',PRODUCTION_SPREADSHEET_ID:'synthetic-production'};
- const ctx=vm.createContext({PropertiesService:{getScriptProperties:()=>({getProperties:()=>p})}});vm.runInContext(text,ctx);
+ const ctx=vm.createContext({PropertiesService:{getScriptProperties:()=>({getProperty:k=>p[k]})}});vm.runInContext(text,ctx);
  assert.throws(()=>ctx.clinicalConfig_(),/production workbook/);p.SPREADSHEET_ID='test';p.LIVE_EMAIL='true';assert.throws(()=>ctx.clinicalConfig_(),/forbidden/);
 });
 test('malformed roster rows surface issues without destroying valid records',()=>{

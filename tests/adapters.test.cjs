@@ -50,7 +50,7 @@ test('projection provides a direct review-row link and escapes formulas',()=>{
 });
 
 function appContext(options={}){
- const state=options.state||E.init({});let released=0,fetches=0,locked=0;const fallback={};
+ const logs=[];const state=options.state||E.init({});let released=0,fetches=0,locked=0;const fallback={};
  const ss=new Spreadsheet();
  for(const tab of ['Students','Archive'])ss.insertSheet(tab).getRange(1,1,tab==='Students'?2:1,4).setValues(tab==='Students'?
   [['First Name','Last Name','Email','Cohort/Class #'],['Example','Student','student@example.test','Class1']]:[['First Name','Last Name','Email','Cohort/Class #']]);
@@ -61,8 +61,8 @@ function appContext(options={}){
   constructor(_ss,_hash,options={}){this.projectionHashes=options.projectionHashes||{};}
   load(){if(options.storageFailure)throw Error('Sheets unavailable');return state;}save(){if(options.commitFailure)throw Error('Commit unavailable');}project(){}reviewLink(id){return 'https://example.test/'+id;}
  }
- const ctx=vm.createContext({ClinicalEngine:E,ClinicalLedger:Store,console,
-  PropertiesService:{getScriptProperties:()=>({getProperties:()=>props,getProperty:k=>fallback[k],setProperty:(k,v)=>{fallback[k]=v;}})},Logger:{log(){}},
+ const ctx=vm.createContext({ClinicalEngine:E,ClinicalLedger:Store,console:{info:value=>logs.push(JSON.parse(value))},
+  PropertiesService:{getScriptProperties:()=>({getProperties:()=>props,getKeys:()=>Object.keys(fallback),deleteProperty:k=>{delete fallback[k];},getProperty:k=>fallback[k]??props[k],setProperty:(k,v)=>{fallback[k]=v;}})},Logger:{log(){}},
   LockService:{getScriptLock:()=>({tryLock(){locked++;return !options.busy;},releaseLock(){released++;}}),getUserLock:()=>({tryLock:()=>!options.healthBusy,releaseLock(){}})},
   SpreadsheetApp:{openById(id){assert.equal(id,'TEST');return ss;}},
   Session:{getScriptTimeZone:()=> 'America/New_York',getEffectiveUser:()=>({getEmail:()=> 'owner@example.test'})},
@@ -73,7 +73,7 @@ function appContext(options={}){
    generated_at:'2026-10-17T08:00:00-04:00',coverage:[{location:'Brewster Ambulance Service Lee County',start:'2026-10-18',end:'2026-11-21'}],coverage_complete:true,status:'complete',shifts:[],errors:[],unresolved_blocks:[]})};}}
  });
  vm.runInContext(fs.readFileSync(__dirname+'/../apps_script/Code.gs','utf8'),ctx);
- return {ctx,state,ss,fallback,stats:()=>({released,fetches,locked})};
+ return {ctx,state,ss,fallback,logs,stats:()=>({released,fetches,locked})};
 }
 test('approved production test requires explicit date and disabled ordinary delivery',()=>{
  const f=appContext(),p=f.ctx.PropertiesService.getScriptProperties().getProperties();
@@ -256,4 +256,70 @@ test('changed projection hashes persist even when the ledger mutates the cached 
 test('daily full view repair is not postponed by frequent incremental view changes',()=>{
  const f=appContext();f.fallback.RR_VIEW_HASHES=JSON.stringify({at:new Date().toISOString(),full_at:new Date(Date.now()-25*3600000).toISOString(),hashes:{}});
  let forced;f.ctx.ClinicalLedger.prototype.project=(_state,force)=>{forced=force;};f.ctx.clinicalSession_(()=>{});assert.equal(forced,true);
+});
+
+test('entry precedes all service calls, includes trigger correlation, and survives properties failure',()=>{
+ const f=appContext();f.ctx.PropertiesService.getScriptProperties=()=>{assert.equal(f.logs[0].edge,'ENTRY');throw Error('private student@example.test token=secret');};
+ assert.throws(()=>f.ctx.dispatchClinicalNotifications({triggerUid:'123456789'}));
+ assert.equal(f.logs[0].function,'dispatchClinicalNotifications');assert.equal(f.logs[0].trigger_uid,'123456789');
+ assert.equal(f.logs.at(-1).edge,'TERMINAL');assert.equal(f.logs.at(-1).phase,'FAILED');
+ assert.ok(!JSON.stringify(f.logs).includes('secret'));assert.ok(!JSON.stringify(f.logs).includes('student@'));
+});
+test('failed and unfinished execution evidence survives subsequent successful recovery',()=>{
+ const f=appContext();assert.throws(()=>f.ctx.clinicalSession_((_s,env)=>env.read('GMAIL_READ',()=>{throw Error('Permission denied private address');}),'DISPATCH'));
+ const key=Object.keys(f.fallback).find(k=>k.startsWith('RR_EXEC_'));const failed=JSON.parse(f.fallback[key]);
+ assert.equal(failed.status,'FAILED');assert.equal(failed.failed_stage,'GMAIL_READ');
+ const unfinished=f.ctx.clinicalTrace_('DISPATCH');unfinished.attach(f.ctx.PropertiesService.getScriptProperties());unfinished.stage('EMAIL_SEND');
+ f.ctx.dispatchClinicalNotifications();assert.equal(JSON.parse(f.fallback[key]).run_id,failed.run_id);
+ const interrupted=Object.values(f.fallback).map(v=>JSON.parse(v)).find(v=>v.run_id===unfinished.runId);
+ assert.equal(interrupted.status,'RUNNING');assert.equal(interrupted.stage,'EMAIL_SEND');
+ assert.equal(JSON.parse(f.fallback.RR_DIAG_DISPATCH).status,'COMPLETED');
+ assert.ok(!JSON.stringify(f.logs).includes('private address'));
+});
+test('skipped overlap cannot erase newer successful heartbeat or mutate business state',()=>{
+ const f=appContext({busy:true}),newer=JSON.stringify({status:'COMPLETED',last_success_at:'2099-01-01T00:00:00Z',run_id:'newer'});
+ f.fallback.RR_DIAG_DISPATCH=newer;f.ctx.dispatchClinicalNotifications();assert.equal(f.fallback.RR_DIAG_DISPATCH,newer);
+ assert.equal(f.state.runs.length,0);assert.ok(Object.values(f.fallback).some(v=>JSON.parse(v).status==='SKIPPED_LOCK'));
+});
+test('waiting invocation reads heartbeat after lock acquisition and retains the newest success on failure',()=>{
+ const f=appContext();f.fallback.RR_DIAG_DISPATCH=JSON.stringify({last_success_at:'2026-10-01T00:00:00Z'});
+ f.ctx.LockService.getScriptLock=()=>({tryLock(){f.fallback.RR_DIAG_DISPATCH=JSON.stringify({last_success_at:'2026-11-01T00:00:00Z'});return true;},releaseLock(){}});
+ assert.throws(()=>f.ctx.clinicalSession_(()=>{throw Error('failure');},'DISPATCH'));
+ assert.equal(JSON.parse(f.fallback.RR_DIAG_DISPATCH).last_success_at,'2026-11-01T00:00:00Z');
+});
+test('diagnostic and alert failures do not mask the business exception or prevent lock release',()=>{
+ const f=appContext(),original=Error('original failure'),p=f.ctx.PropertiesService.getScriptProperties();
+ f.ctx.PropertiesService.getScriptProperties=()=>({...p,setProperty(k,v){if(k.startsWith('RR_EXEC_')||k.startsWith('RR_DIAG_'))throw Error('logging failed');p.setProperty(k,v);}});
+ f.ctx.console.info=()=>{throw Error('console failed');};f.ctx.clinicalFallbackAlert_=()=>{throw Error('alert failed');};
+ assert.throws(()=>f.ctx.clinicalSession_(()=>{throw original;},'DISPATCH'),e=>e===original);assert.equal(f.stats().released,1);
+ f.ctx.dispatchClinicalNotifications();assert.equal(f.stats().released,2);
+});
+test('retention admission is bounded and preserves active records; output has a reserved terminal record',()=>{
+ const f=appContext(),p=f.ctx.PropertiesService.getScriptProperties();
+ for(let i=0;i<48;i++)f.fallback['RR_EXEC_active-'+i]=JSON.stringify({status:'RUNNING',started_at:new Date().toISOString()});
+ const t=f.ctx.clinicalTrace_('DISPATCH');t.attach(p);for(let i=0;i<500;i++)t.stage('SAFE_READ');t.finish('FAILED');
+ assert.equal(Object.keys(f.fallback).filter(k=>k.startsWith('RR_EXEC_')).length,48);
+ assert.ok(f.logs.some(v=>v.phase==='RETENTION_FULL'));assert.equal(f.logs.at(-1).edge,'TERMINAL');assert.ok(f.logs.length<=241);
+ // Finished evidence may be evicted at capacity, but current active evidence survives.
+ f.fallback.RR_EXEC_finished=JSON.stringify({status:'FAILED',started_at:'2020-01-01T00:00:00Z'});delete f.fallback['RR_EXEC_active-0'];
+ const next=f.ctx.clinicalTrace_('DISPATCH');next.attach(p);next.finish('HELD');
+ assert.equal(Object.keys(f.fallback).filter(k=>k.startsWith('RR_EXEC_')).length,48);assert.equal(f.fallback.RR_EXEC_finished,undefined);
+ assert.ok(Object.values(f.fallback).every(v=>v.length<1024));
+});
+test('operation records bracket service work with duration and never retry a send',()=>{
+ const f=appContext(),t=f.ctx.clinicalTrace_('DISPATCH');let sends=0;
+ const transport=f.ctx.clinicalTransport_({op:t.operation});f.ctx.GmailApp.createDraft=()=>({getId:()=> 'draft'});
+ f.ctx.GmailApp.getDraft=()=>({send(){sends++;throw Error('ambiguous send');}});
+ assert.equal(transport.prepare({to:['private@example.test'],subject:'private',body:'private'}),'draft');
+ assert.throws(()=>transport.sendPrepared('draft'));assert.equal(sends,1);
+ const phases=f.logs.filter(v=>v.phase==='EMAIL_DRAFT_PREPARE');assert.deepEqual(phases.map(v=>v.edge),['BEFORE','AFTER']);
+ assert.equal(typeof phases[1].elapsed_ms,'number');assert.ok(!JSON.stringify(f.logs).includes('private'));
+});
+test('failed heartbeat read cannot erase a successful heartbeat or overdue reminder evidence',()=>{
+ const f=appContext(),p=f.ctx.PropertiesService.getScriptProperties(),prior=JSON.stringify({last_success_at:'2026-11-01T00:00:00Z',next_due_at:'2026-11-03T13:00:00Z',uncertain_count:0});f.fallback.RR_DIAG_DISPATCH=prior;
+ f.ctx.PropertiesService.getScriptProperties=()=>({...p,getProperty(k){if(k==='RR_DIAG_DISPATCH')throw Error('read failed');return p.getProperty(k);}});
+ assert.throws(()=>f.ctx.dispatchClinicalNotifications());assert.equal(f.fallback.RR_DIAG_DISPATCH,prior);
+ f.ctx.PropertiesService.getScriptProperties=()=>p;
+ assert.throws(()=>f.ctx.clinicalSession_(()=>{throw Error('processing failed');},'DISPATCH'));
+ const failed=JSON.parse(f.fallback.RR_DIAG_DISPATCH);assert.equal(failed.next_due_at,'2026-11-03T13:00:00Z');assert.equal(failed.last_success_at,'2026-11-01T00:00:00Z');
 });
