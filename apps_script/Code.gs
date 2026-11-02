@@ -2,7 +2,8 @@
  * by this file. LIVE_EMAIL is false unless explicitly configured at cutover.
  */
 function clinicalConfig_() {
-  const p=PropertiesService.getScriptProperties().getProperties();
+  const props=PropertiesService.getScriptProperties(),p={};
+  for(const key of ['RUN_MODE','SPREADSHEET_ID','PRODUCTION_SPREADSHEET_ID','PRODUCTION_CUTOVER_APPROVED','LIVE_EMAIL','PARSER_URL','PARSER_API_TOKEN','ARCHIVE_FOLDER_ID','NOTIFICATIONS_FROM','NOTIFICATION_TO','OWNER_EMAIL'])p[key]=props.getProperty(key);
   if(!['TEST','PRODUCTION'].includes(p.RUN_MODE)) throw Error('Set RUN_MODE explicitly');
   if(!p.SPREADSHEET_ID||!p.PRODUCTION_SPREADSHEET_ID) throw Error('Set explicit SPREADSHEET_ID and PRODUCTION_SPREADSHEET_ID');
   if(p.RUN_MODE==='TEST'&&p.SPREADSHEET_ID===p.PRODUCTION_SPREADSHEET_ID) throw Error('Test jobs cannot use the production workbook');
@@ -25,11 +26,65 @@ function clinicalHash_(value) {
 function clinicalJSON_(text,fallback) {
   try {const value=JSON.parse(text||'null');return value&&typeof value==='object'?value:fallback;} catch(_e) {return fallback;}
 }
+// This identifier travels with entry, phase and terminal records; no Google call
+// (including UUID or properties access) is needed to create the entry record.
+const CLINICAL_RELEASE_='execution-diagnostics-v1';
+function clinicalTrace_(kind,event) {
+  const started=Date.now(),runId=started.toString(36)+'-'+Math.random().toString(36).slice(2,14);
+  const functions={DISPATCH:'dispatchClinicalNotifications',INGEST:'ingestClinicalCalendars',CANCELLATIONS:'watchClinicalCancellations',HEALTH:'checkClinicalHealth',DELIVERY_HEALTH:'checkClinicalDeliveryHealth',VIEWS:'refreshClinicalViews'};
+  const base={release:CLINICAL_RELEASE_,kind,function:functions[kind]||'clinicalSession_',run_id:runId,started_at:new Date(started).toISOString()};
+  if(event&&/^[0-9]{1,30}$/.test(String(event.triggerUid||'')))base.trigger_uid=String(event.triggerUid);
+  let count=0,props,key,checkpoints=0,current='ENTRY';
+  const record=(phase,edge,elapsed)=>{
+    try {if(count++<240||edge==='TERMINAL')console.info(JSON.stringify(Object.assign({},base,{at:new Date().toISOString(),phase,edge,elapsed_ms:elapsed==null?Date.now()-started:elapsed})));}catch(_ignored){}
+  };
+  record('ENTRY','ENTRY');
+  const snapshot=status=>Object.assign({},base,{stage:current,status,at:new Date().toISOString()});
+  // Unique execution keys, admitted/pruned under the user lock. There is no
+  // shared-array append and no eviction of a possibly live (<1h) execution.
+  // Successful runs delete their key; failures/held/skipped/interrupted runs
+  // survive later successes, up to 48 records / <48 KiB payload; capacity sweeps remove >7d records.
+  const attach=p=>{
+    props=p;let guard,held=false;
+    try {
+      guard=LockService.getUserLock();held=guard.tryLock(1);if(!held){record('RETENTION_BUSY','UNAVAILABLE');return;}
+      const keys=props.getKeys().filter(k=>/^RR_EXEC_[a-z0-9-]+$/.test(k));
+      if(keys.length>=48) {
+        const rows=keys.map(k=>({key:k,value:clinicalJSON_(props.getProperty(k),{})})).sort((a,b)=>Date.parse(a.value.started_at||0)-Date.parse(b.value.started_at||0));
+        for(const row of rows) {
+          const age=Date.now()-Date.parse(row.value.started_at||'');
+          if(age>7*86400000||(keys.length>=48&&(row.value.status!=='RUNNING'||age>3600000))) {props.deleteProperty(row.key);keys.splice(keys.indexOf(row.key),1);}
+        }
+      }
+      if(keys.length>=48){record('RETENTION_FULL','UNAVAILABLE');return;}
+      key='RR_EXEC_'+runId;props.setProperty(key,JSON.stringify(snapshot('RUNNING')));
+    }catch(_ignored){key=null;record('RETENTION','UNAVAILABLE');}
+    finally {if(held)try{guard.releaseLock();}catch(_ignored){}}
+  };
+  const stage=phase=>{
+    // Only fixed internal labels are passed here; never pass exception text,
+    // student IDs, subjects, message content, provider IDs or config values.
+    current=/^[A-Z][A-Z0-9_:]{0,63}$/i.test(phase)?phase:'OTHER';record(current,'BEFORE');
+    if(key&&Date.now()-started<3600000&&checkpoints++<24)try{props.setProperty(key,JSON.stringify(snapshot('RUNNING')));}catch(_ignored){}
+  };
+  const operation=(phase,fn)=>{
+    stage(phase);const at=Date.now();
+    try{const value=fn();record(current===phase?current:phase,'AFTER',Date.now()-at);return value;}
+    catch(error){record(phase,'ERROR',Date.now()-at);throw error;}
+  };
+  const finish=(status,failedStage)=>{
+    record(status,'TERMINAL');
+    if(key&&Date.now()-started<3600000)try{if(status==='COMPLETED')props.deleteProperty(key);else props.setProperty(key,JSON.stringify(Object.assign(snapshot(status),failedStage?{failed_stage:failedStage}:{})));}catch(_ignored){}
+  };
+  return {started,runId,stage,operation,attach,finish,record};
+}
 // Read retries only. Never wrap ledger commits, draft creation or email sending.
 function clinicalRead_(label,fn,context) {
   for(let attempt=0;;attempt++) {
     if(context&&context.stage)context.stage(label);
-    try {return fn();} catch(error) {
+    const at=Date.now();
+    try {const value=fn();if(context&&context.after)context.after(label,Date.now()-at);return value;} catch(error) {
+      if(context&&context.readError)context.readError(label,Date.now()-at);
       if(attempt>=2||!/(server error|temporar|internal error|unavailable|timed out|timeout|\b(?:429|502|503)\b)/i.test(String(error))||
         (context&&context.shouldStop&&context.shouldStop())) throw error;
       if(context&&context.retry)context.retry(label);
@@ -37,28 +92,36 @@ function clinicalRead_(label,fn,context) {
     }
   }
 }
-function clinicalSession_(fn,kind='GENERAL') {
-  const props=PropertiesService.getScriptProperties(),diagKey='RR_DIAG_'+kind;
-  const prior=clinicalJSON_(props.getProperty(diagKey),{}),started=Date.now(),deadline=started+240000;
-  const diag=Object.assign({},prior,{run_id:Utilities.getUuid(),started_at:new Date(started).toISOString(),stage:'CONFIG',status:'RUNNING',read_retries:0});
-  const stage=value=>{diag.stage=value;diag.stage_at=new Date().toISOString();props.setProperty(diagKey,JSON.stringify(diag));};
-  const context={stage,shouldStop:()=>Date.now()>deadline,retry:()=>{diag.read_retries++;}};
-  let config,lock,acquired=false;
+function clinicalSession_(fn,kind='GENERAL',event) {
+  const trace=clinicalTrace_(kind,event),started=trace.started,deadline=started+240000,diagKey='RR_DIAG_'+kind;
+  let props,prior={},config,lock,acquired=false,priorLoaded=false,terminal='FAILED',businessError;
+  const diag={run_id:trace.runId,release:CLINICAL_RELEASE_,started_at:new Date(started).toISOString(),stage:'ENTRY',status:'RUNNING',read_retries:0};
+  const stage=value=>{diag.stage=value;diag.stage_at=new Date().toISOString();trace.stage(value);};
+  const op=(label,fn)=>{stage(label);const at=Date.now();try{const value=fn();trace.record(label,'AFTER',Date.now()-at);return value;}catch(error){trace.record(label,'ERROR',Date.now()-at);throw error;}};
+  const context={stage,op,after:(label,elapsed)=>trace.record(label,'AFTER',elapsed),shouldStop:()=>Date.now()>deadline,readError:(label,elapsed)=>trace.record(label,'ERROR',elapsed),retry:label=>{diag.read_retries++;trace.record(label,'RETRY');}};
+  // Metadata is best effort. It cannot change delivery decisions, replace an
+  // original exception or cause a completed send to be retried.
+  const heartbeat=()=>{if(acquired&&priorLoaded)try{props.setProperty(diagKey,JSON.stringify(diag));}catch(_ignored){trace.record('HEARTBEAT','UNAVAILABLE');}};
   try {
-    stage('CONFIG');config=clinicalConfig_();lock=LockService.getScriptLock();stage('LOCK');
-    if(!lock.tryLock(5000)) {diag.status='SKIPPED_LOCK';stage('SKIPPED_LOCK');return;}
+    props=op('PROPERTIES_ACCESS',()=>PropertiesService.getScriptProperties());trace.attach(props);
+    config=op('CONFIG',()=>clinicalConfig_());lock=op('LOCK_GET',()=>LockService.getScriptLock());
+    if(!op('LOCK_ACQUIRE',()=>lock.tryLock(5000))) {terminal='SKIPPED_LOCK';return;}
     acquired=true;
+    // Read after acquiring the business lock. Skipped/pre-lock failures never
+    // mutate the heartbeat, and a stale waiter cannot restore an old success.
+    prior=clinicalJSON_(op('HEARTBEAT_READ',()=>props.getProperty(diagKey)),{});priorLoaded=true;
+    for(const key of ['last_success_at','consecutive_failures','next_due_at','uncertain_count'])if(prior[key]!=null)diag[key]=prior[key];
     const ss=clinicalRead_('WORKBOOK_OPEN',()=>SpreadsheetApp.openById(config.sheet),context);
     if(ss.getSpreadsheetTimeZone()!=='America/New_York'||Session.getScriptTimeZone()!=='America/New_York') throw Error('Workbook and script must use America/New_York');
     const cache=clinicalJSON_(props.getProperty('RR_VIEW_HASHES'),{});
     const priorHashes=JSON.stringify(cache.hashes||{});
-    const store=new ClinicalLedger(ss,clinicalHash_,{projectionHashes:cache.hashes||{},stage,read:(label,read)=>clinicalRead_(label,read,context)});
-    stage('LEDGER_LOAD');const state=store.load();
+    const store=new ClinicalLedger(ss,clinicalHash_,{projectionHashes:cache.hashes||{},stage,op,read:(label,read)=>clinicalRead_(label,read,context)});
+    const state=op('LEDGER_LOAD',()=>store.load());
     const env=Object.assign({},config,context,{props,now:Date.now(),hash:clinicalHash_,
       read:(label,read)=>clinicalRead_(label,read,context),reviewLink:id=>store.reviewLink(id,state),
       dayKey:now=>Utilities.formatDate(new Date(now),'America/New_York','yyyy-MM-dd')});
     let outcome,processingError;
-    try {stage('PROCESS');outcome=fn(state,env,store,ss);}
+    try {outcome=op('PROCESS',()=>fn(state,env,store,ss));}
     catch(error) {processingError=error;diag.failed_stage=diag.stage;}
     try {
       store.save(state);stage('VIEWS');
@@ -67,7 +130,7 @@ function clinicalSession_(fn,kind='GENERAL') {
       store.project(state,force);
       const nextHashes=JSON.stringify(store.projectionHashes||{});
       if(force||nextHashes!==priorHashes) props.setProperty('RR_VIEW_HASHES',JSON.stringify({at:new Date().toISOString(),full_at:force?new Date().toISOString():(cache.full_at||cache.at),hashes:store.projectionHashes||{}}));
-    } catch(error) {if(processingError){diag.finalization_error=String(error).slice(0,1000);throw processingError;}throw error;}
+    } catch(error) {if(processingError){diag.finalization_error='FINALIZATION_FAILED';throw processingError;}throw error;}
     if(processingError)throw processingError;
     diag.status=outcome===false?'HELD':'COMPLETED';diag.ended_at=new Date().toISOString();
     if(outcome!==false) {diag.last_success_at=diag.ended_at;diag.consecutive_failures=0;delete diag.error;delete diag.failed_stage;delete diag.finalization_error;}
@@ -82,12 +145,16 @@ function clinicalSession_(fn,kind='GENERAL') {
       published_at:state.sources.filter(s=>s.status==='APPLIED'&&s.coverage.some(c=>c.location===site)).map(s=>s.version_at).filter(Boolean).sort().slice(-1)[0]||null}))};
     const healthText=JSON.stringify(scheduleHealth);
     if(props.getProperty('RR_SCHEDULE_HEALTH')!==healthText)props.setProperty('RR_SCHEDULE_HEALTH',healthText);
-    stage(diag.status);
+    terminal=diag.status;heartbeat();
   } catch(error) {
-    diag.status='FAILED';diag.failed_stage=diag.failed_stage||diag.stage;diag.error=String(error).slice(0,1000);diag.ended_at=new Date().toISOString();
-    diag.consecutive_failures=(prior.consecutive_failures||0)+1;stage('FAILED');
-    if(config)clinicalFallbackAlert_(config,error);throw error;
-  } finally {if(acquired)lock.releaseLock();}
+    businessError=error;diag.status='FAILED';diag.failed_stage=diag.failed_stage||diag.stage;diag.error='EXECUTION_FAILED';diag.ended_at=new Date().toISOString();
+    diag.consecutive_failures=(prior.consecutive_failures||0)+1;heartbeat();
+    if(config)try{op('OWNER_FAILURE_ALERT',()=>clinicalFallbackAlert_(config,error));}catch(_alertError){trace.record('OWNER_FAILURE_ALERT','ERROR');}throw error;
+  } finally {
+    try {if(acquired)op('LOCK_RELEASE',()=>lock.releaseLock());}
+    catch(error){terminal='FAILED';if(!businessError)throw error;}
+    finally {trace.finish(terminal,diag.failed_stage);}
+  }
 }
 function clinicalFallbackAlert_(config,error) {
   // Separate small failure ledger when the Sheets ledger itself is unavailable.
@@ -136,7 +203,7 @@ function clinicalRoster_(ss,state,env) {
   roster.issues.forEach(issue=>ClinicalEngine.review(state,env,issue));
   return roster;
 }
-function ingestClinicalCalendars() {
+function ingestClinicalCalendars(event) {
   clinicalSession_((state,env,store,ss)=>{
     const started=Date.now(),run={id:Utilities.getUuid(),type:'INGEST',started_at:new Date().toISOString(),status:'RUNNING'};
     state.runs.push(run);store.save(state);
@@ -182,20 +249,22 @@ function ingestClinicalCalendars() {
       run.status=finished?'COMPLETED':'CONTINUATION';run.ended_at=new Date().toISOString();
     } catch(e) {run.status='FAILED';run.ended_at=new Date().toISOString();ClinicalEngine.review(state,env,{category:'INGEST_FAILURE',source_id:run.id,reason:String(e)});}
     return run.status==='COMPLETED';
-  },'INGEST');
+  },'INGEST',event);
 }
 function clinicalTransport_(env) {
   return {
-    prepare(mail) {if(env&&env.stage)env.stage('EMAIL_DRAFT_PREPARE');return GmailApp.createDraft(mail.to.join(','),mail.subject,mail.body,mail.cc?{cc:mail.cc}:{}).getId();},
+    prepare(mail) {const create=()=>GmailApp.createDraft(mail.to.join(','),mail.subject,mail.body,mail.cc?{cc:mail.cc}:{}).getId();return env&&env.op?env.op('EMAIL_DRAFT_PREPARE',create):create();},
     sendPrepared(id) {
       const draft=env&&env.read?env.read('EMAIL_DRAFT_READ',()=>GmailApp.getDraft(id)):GmailApp.getDraft(id);
-      if(env&&env.stage)env.stage('EMAIL_SEND');return draft.send().getId();
+      return env&&env.op?env.op('EMAIL_SEND',()=>draft.send().getId()):draft.send().getId();
     },
     findAccepted(id) {
+      const reconcile=()=>{
       const marker='[RR:'+id+']';
       const owner=Session.getEffectiveUser().getEmail();
       for(const t of (env&&env.read?env.read('SENT_EVIDENCE',()=>GmailApp.search('in:sent from:me "'+marker+'"',0,20)):GmailApp.search('in:sent from:me "'+marker+'"',0,20))) for(const m of t.getMessages()) if(m.getSubject().includes(marker)&&m.getFrom().includes(owner)) return m.getId();
       return null;
+      };return env&&env.op?env.op('EMAIL_EVIDENCE_RECONCILE',reconcile):reconcile();
     }
   };
 }
@@ -250,17 +319,17 @@ function clinicalCancellationScan_(state,env,store,ss) {
     store.save(state);return false;
   }
 }
-function watchClinicalCancellations() {
+function watchClinicalCancellations(event) {
   clinicalSession_((state,env,store,ss)=>{clinicalCancellationScan_(state,env,store,ss);
-    ClinicalEngine.dispatch(state,Object.assign({},env,{ownerOnly:true}),clinicalTransport_(env),s=>store.save(s));},'CANCELLATIONS');
+    ClinicalEngine.dispatch(state,Object.assign({},env,{ownerOnly:true}),clinicalTransport_(env),s=>store.save(s));},'CANCELLATIONS',event);
 }
-function dispatchClinicalNotifications() {
+function dispatchClinicalNotifications(event) {
   clinicalSession_((state,env,store,ss)=>{
     const complete=clinicalCancellationScan_(state,env,store,ss);
     env.now=Date.now();
     ClinicalEngine.dispatch(state,complete?env:Object.assign({},env,{ownerOnly:true}),clinicalTransport_(env),s=>store.save(s));
     return complete;
-  },'DISPATCH');
+  },'DISPATCH',event);
 }
 // A separately approved live test, while normal delivery remains disabled.
 // The engine applies the date scope before recovery, previews, or provider calls.
@@ -273,22 +342,34 @@ function dispatchClinicalApprovedTest() {
     ClinicalEngine.dispatch(state,scoped,clinicalTransport_(),s=>store.save(s));
   });
 }
-function checkClinicalHealth() {
+function checkClinicalHealth(event) {
   clinicalSession_((state,env,store)=>{
     ClinicalEngine.monitor(state,env);store.save(state);
     // Independent watchdog can deliver owner alerts even if the ordinary shift
     // dispatcher is absent; it never sends student scheduling notifications.
     ClinicalEngine.dispatch(state,Object.assign({},env,{ownerOnly:true}),clinicalTransport_(env),s=>store.save(s));
-  },'HEALTH');
+  },'HEALTH',event);
 }
 // Separate trigger: reads only small Script Properties heartbeats. It remains
 // useful when dispatch or Sheets fails; Google-wide outages still need Google's
 // native failure notifications. Never sends student mail or retries a send.
-function checkClinicalDeliveryHealth() {
-  // A distinct lock lets monitoring run even if dispatch holds the script lock.
-  const lock=LockService.getUserLock();if(!lock.tryLock(1000))return {status:'SKIPPED_LOCK'};
-  try {return clinicalDeliveryHealth_(clinicalConfig_(),PropertiesService.getScriptProperties(),Date.now());}
-  finally {lock.releaseLock();}
+function checkClinicalDeliveryHealth(event) {
+  const trace=clinicalTrace_('DELIVERY_HEALTH',event);
+  let lock,acquired=false,terminal='FAILED',failure;
+  try {
+    const props=trace.operation('PROPERTIES_ACCESS',()=>PropertiesService.getScriptProperties());trace.attach(props);
+    lock=trace.operation('LOCK_GET',()=>LockService.getUserLock());
+    if(!trace.operation('LOCK_ACQUIRE',()=>lock.tryLock(1000))){terminal='SKIPPED_LOCK';return {status:terminal};}
+    acquired=true;
+    const config=trace.operation('CONFIG',()=>clinicalConfig_());
+    const result=trace.operation('DELIVERY_HEALTH_CHECK',()=>clinicalDeliveryHealth_(config,props,Date.now()));
+    terminal='COMPLETED';return result;
+  } catch(error){failure=error;throw error;}
+  finally {
+    try{if(acquired)trace.operation('LOCK_RELEASE',()=>lock.releaseLock());}
+    catch(error){terminal='FAILED';if(!failure)throw error;}
+    finally{trace.finish(terminal);}
+  }
 }
 function clinicalDeliveryHealth_(config,props,now) {
   const dispatch=clinicalJSON_(props.getProperty('RR_DIAG_DISPATCH'),{}),scan=clinicalJSON_(props.getProperty('RR_CANCEL_CURSOR'),{});
@@ -334,8 +415,8 @@ function clinicalDeliveryHealth_(config,props,now) {
   } catch(error) {record.status='UNCERTAIN';record.error=String(error).slice(0,1000);props.setProperty('RR_DELIVERY_HEALTH',JSON.stringify(record));throw error;}
   return diagnostic;
 }
-function refreshClinicalViews() {
-  clinicalSession_((_state,env)=>{env.forceViews=true;},'VIEWS');
+function refreshClinicalViews(event) {
+  clinicalSession_((_state,env)=>{env.forceViews=true;},'VIEWS',event);
 }
 function applyClinicalReviewActions() {
   clinicalSession_((state,env,store,ss)=>{
