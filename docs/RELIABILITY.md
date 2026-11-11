@@ -2,6 +2,14 @@
 
 The five-minute dispatcher retains its reminder timing, recipients, cancellation preflight, exclusive business lock and durable send protocol. This update reduces service work and adds diagnostics; it does not guarantee that Google will never fail an execution before the script starts.
 
+## Roster read reliability
+
+`roster-read-reliability-v2` addresses the November 9 stalled roster-read boundary. Roster validation reads headers and only the identity columns (First Name, Last Name, Email, Cohort/Class #, optional Student ID), coalescing adjacent columns and one-column gaps. It preserves exact header validation, explicit IDs, partial-identity reviews, duplicate identity checks and active/archive semantics. Rows with no identity fields are treated as templates; unrelated clinical fields are not identity evidence. Tab-specific `ROSTER_STUDENTS_*` and `ROSTER_ARCHIVE_*` phases identify the read boundary. In the 34-column production layout, the data read spans B:F and AH, six columns instead of all 34; no unrelated clinical columns are rewritten.
+
+A cancellation scan loads the roster once, lazily, only when an unprocessed Brewster cancellation candidate requires identity matching. A quiet scan still checks Gmail and advances its successful cancellation heartbeat, but does not read the roster. Under-review candidates are still reconsidered. Roster or Gmail failure on a candidate leaves the cursor unchanged and holds ride messages. Hourly ingestion continues validating the roster and reporting identity problems. Recipient snapshots, notification IDs and the send protocol are unchanged; this release does not alter previously queued recipients or add automatic roster ID write-back.
+
+New safe reads check the execution budget before invoking Google. Processing stops with 30 seconds reserved inside the existing four-minute session budget for ledger/view finalization. Calendar ingestion checks between messages and attachments; an unfinished thread page keeps its original offset and replays idempotently, skipping already accepted PDFs. These are cooperative boundaries: they cannot interrupt a synchronous Google call that never returns, or prevent a failure before application ENTRY.
+
 ## Efficient persistence and views
 
 The checksum-verified two-bank ledger remains authoritative. Unchanged state does not write a new snapshot. A quiet cancellation pass records its success in small Script Properties rather than rewriting the entire ledger for a heartbeat. Full daily scans, business changes and failures retain run records in the ledger; the most recent 100 cancellation journal records are retained. Live scan counts and freshness are in RR_CANCEL_CURSOR and RR_DIAG_DISPATCH.
