@@ -28,7 +28,7 @@ function clinicalJSON_(text,fallback) {
 }
 // This identifier travels with entry, phase and terminal records; no Google call
 // (including UUID or properties access) is needed to create the entry record.
-const CLINICAL_RELEASE_='execution-diagnostics-v1';
+const CLINICAL_RELEASE_='roster-read-reliability-v2';
 function clinicalTrace_(kind,event) {
   const started=Date.now(),runId=started.toString(36)+'-'+Math.random().toString(36).slice(2,14);
   const functions={DISPATCH:'dispatchClinicalNotifications',INGEST:'ingestClinicalCalendars',CANCELLATIONS:'watchClinicalCancellations',HEALTH:'checkClinicalHealth',DELIVERY_HEALTH:'checkClinicalDeliveryHealth',VIEWS:'refreshClinicalViews'};
@@ -81,6 +81,7 @@ function clinicalTrace_(kind,event) {
 // Read retries only. Never wrap ledger commits, draft creation or email sending.
 function clinicalRead_(label,fn,context) {
   for(let attempt=0;;attempt++) {
+    if(context&&context.shouldStop&&context.shouldStop()) throw Error('Execution budget exhausted before '+label);
     if(context&&context.stage)context.stage(label);
     const at=Date.now();
     try {const value=fn();if(context&&context.after)context.after(label,Date.now()-at);return value;} catch(error) {
@@ -118,6 +119,7 @@ function clinicalSession_(fn,kind='GENERAL',event) {
     const store=new ClinicalLedger(ss,clinicalHash_,{projectionHashes:cache.hashes||{},stage,op,read:(label,read)=>clinicalRead_(label,read,context)});
     const state=op('LEDGER_LOAD',()=>store.load());
     const env=Object.assign({},config,context,{props,now:Date.now(),hash:clinicalHash_,
+      shouldStop:()=>Date.now()>deadline-30000,
       read:(label,read)=>clinicalRead_(label,read,context),reviewLink:id=>store.reviewLink(id,state),
       dayKey:now=>Utilities.formatDate(new Date(now),'America/New_York','yyyy-MM-dd')});
     let outcome,processingError;
@@ -178,25 +180,38 @@ function clinicalFallbackAlert_(config,error) {
   }catch(sendError){entry.status='UNCERTAIN';entry.send_error=String(sendError).slice(0,500);properties.setProperty(key,JSON.stringify(entry));}
 }
 function clinicalRoster_(ss,state,env) {
-  const rows=[];
+  const rows=[],read=env.read||((_label,fn)=>fn());
   for(const tab of ['Students','Archive']) {
-    const sheet=env.read?env.read('ROSTER_LOOKUP',()=>ss.getSheetByName(tab)):ss.getSheetByName(tab);if(!sheet) throw Error('Missing roster tab '+tab);
-    const values=env.read?env.read('ROSTER_READ',()=>sheet.getDataRange().getValues()):sheet.getDataRange().getValues(),headers=values[0].map(String);
-    const idx={};for(const name of ['First Name','Last Name','Email','Cohort/Class #']) {
+    const label='ROSTER_'+tab.toUpperCase();
+    const sheet=read(label+'_LOOKUP',()=>ss.getSheetByName(tab));if(!sheet) throw Error('Missing roster tab '+tab);
+    const bounds=read(label+'_BOUNDS',()=>({rows:sheet.getLastRow(),columns:sheet.getLastColumn()}));
+    if(!bounds.rows||!bounds.columns)throw Error('Missing roster headers in '+tab);
+    const headers=read(label+'_HEADERS',()=>sheet.getRange(1,1,1,bounds.columns).getValues())[0].map(String);
+    const idx={};for(const name of ['First Name','Last Name','Email','Cohort/Class #','Student ID']) {
       const matches=headers.map((h,i)=>h.trim()===name?i:-1).filter(i=>i>=0);
-      if(matches.length!==1) throw Error('Expected one explicit header '+name+' in '+tab);idx[name]=matches[0];
+      if(matches.length>1||(name!=='Student ID'&&matches.length!==1))throw Error('Expected one explicit header '+name+' in '+tab);
+      idx[name]=matches.length?matches[0]:-1;
     }
-    const idCol=headers.indexOf('Student ID');
-    values.slice(1).forEach((r,i)=>{
-      if(r.every(v=>v===''||v===false)) {
-        // Google returns unchecked template checkboxes as false, not blank.
+    // Read only identity columns. Coalesce adjacent columns and one-column
+    // gaps (the production Phone column), never the unrelated clinical grid.
+    const columns=Object.values(idx).filter(i=>i>=0).sort((a,b)=>a-b),groups=[];
+    for(const col of columns) {
+      const last=groups[groups.length-1];if(last&&col-last.end<=2)last.end=col;else groups.push({start:col,end:col});
+    }
+    const values=Array.from({length:Math.max(0,bounds.rows-1)},()=>[]);
+    if(values.length)for(let g=0;g<groups.length;g++) {
+      const group=groups[g],block=read(label+'_IDENTITY_'+(g+1),()=>sheet.getRange(2,group.start+1,values.length,group.end-group.start+1).getValues());
+      block.forEach((r,i)=>r.forEach((v,j)=>{values[i][group.start+j]=v;}));
+    }
+    values.forEach((r,i)=>{
+      if(columns.every(c=>r[c]===''||r[c]===false||r[c]==null)) {
         state.reviews.filter(review=>review.category==='INVALID_ROSTER_ROW'&&review.source_id===tab+':'+(i+2)&&review.status==='OPEN').forEach(review=>{
-          review.status='RESOLVED';review.resolution='Verified empty template row: only blank values and unchecked checkboxes';review.resolved_at=new Date().toISOString();
+          review.status='RESOLVED';review.resolution='No student identity fields in this template row';review.resolved_at=new Date().toISOString();
         });
         return;
       }
       rows.push({first_name:String(r[idx['First Name']]||'').trim(),last_name:String(r[idx['Last Name']]||'').trim(),email:String(r[idx.Email]||'').trim(),
-        cohort:String(r[idx['Cohort/Class #']]||''),student_id:idCol>=0?String(r[idCol]||'').trim():'',source_tab:tab,source_row:i+2,status:tab==='Archive'?'ARCHIVED':'ACTIVE'});
+        cohort:String(r[idx['Cohort/Class #']]||''),student_id:idx['Student ID']>=0?String(r[idx['Student ID']]||'').trim():'',source_tab:tab,source_row:i+2,status:tab==='Archive'?'ARCHIVED':'ACTIVE'});
     });
   }
   const roster=ClinicalEngine.buildRoster(rows,state.students,env);
@@ -210,14 +225,18 @@ function ingestClinicalCalendars(event) {
     try {
       const roster=clinicalRoster_(ss,state,env);
       let offset=state.gmail_offset||0,finished=false;
-      while(Date.now()-started<220000) {
+      pageLoop: while(Date.now()-started<220000&&!env.shouldStop()) {
         const threads=env.read('CALENDAR_SEARCH',()=>GmailApp.search(env.gmailQuery,offset,20));
         if(!threads.length) {finished=true;break;}
         // Complete a thread page before advancing the checkpoint. Replay is safe.
-        for(const thread of threads) for(const message of env.read('CALENDAR_THREAD',()=>thread.getMessages())) {
+        for(const thread of threads) {
+          if(env.shouldStop())break pageLoop;
+          for(const message of env.read('CALENDAR_THREAD',()=>thread.getMessages())) {
+          if(env.shouldStop())break pageLoop;
           if(!/Calendar.*Brewster/i.test(message.getSubject())||!String(message.getFrom()).includes('donotreply@platinumed.com')) continue;
           const attachments=message.getAttachments({includeInlineImages:false});let calendars=0;
           for(let index=0;index<attachments.length;index++) {
+            if(env.shouldStop())break pageLoop;
             const attachment=attachments[index],name=attachment.getName();
             if(!/^Calendar-RickyRescue-Brewster.*\.pdf$/i.test(name)) continue;
             calendars++;
@@ -241,7 +260,7 @@ function ingestClinicalCalendars(event) {
             }
           }
           if(!calendars) ClinicalEngine.review(state,env,{category:'MISSING_ATTACHMENT',source_id:message.getId(),reason:'Calendar email has no recognized Brewster PDF attachment'});
-        }
+        }}
         offset+=threads.length;state.gmail_offset=offset;store.save(state);
         if(threads.length<20) {finished=true;break;}
       }
@@ -280,7 +299,8 @@ function clinicalCancellationScan_(state,env,store,ss) {
   const full=!Number.isFinite(since)||since>now||!Number.isFinite(lastFull)||lastFull>now||now-lastFull>=86400000;
   const window=full||!Number.isFinite(since)?'newer_than:180d':'after:'+Math.floor((since-48*3600000)/1000);
   const query='from:donotreply@platinumed.com '+window+' {"marked themselves absent" "clinical cancelled" "clinical canceled" "shift cancelled" "shift canceled" "has been cancelled" "has been canceled"}';
-  const before=env.hash(JSON.stringify(state)),roster=clinicalRoster_(ss,state,env);
+  const before=env.hash(JSON.stringify(state));
+  let roster;const getRoster=()=>roster||(roster=clinicalRoster_(ss,state,env));
   const run={id:Utilities.getUuid(),type:'CANCELLATION_WATCHDOG',started_at:new Date(now).toISOString(),scan_mode:full?'FULL':'RECENT',status:'RUNNING'};
   const seen=new Set(Array.isArray(cursor.seen_ids)?cursor.seen_ids.filter(id=>typeof id==='string'):[]),read=env.read||((_label,fn)=>fn());
   try {
@@ -297,7 +317,7 @@ function clinicalCancellationScan_(state,env,store,ss) {
         const body=read('CANCELLATION_BODY',()=>message.getPlainBody());
         if(!/Brewster Ambulance Service/i.test(body)||!/(?:marked themselves absent|clinical cancel(?:led|ed)|shift cancel(?:led|ed)|has been cancel(?:led|ed))/i.test(body)) {seen.add(id);continue;}
         ClinicalEngine.ingestCancellation(state,env,{id,received_at:message.getDate().toISOString(),body,
-          authenticated:clinicalCancellationAuthenticated_(read('CANCELLATION_AUTH',()=>message.getRawContent()),message.getFrom())},roster);
+          authenticated:clinicalCancellationAuthenticated_(read('CANCELLATION_AUTH',()=>message.getRawContent()),message.getFrom())},getRoster());
       }
     }
     run.status='COMPLETED';run.ended_at=new Date().toISOString();
