@@ -15,6 +15,7 @@ class Sheet {
  };}
  getDataRange(){return this.getRange(1,1,this.getLastRow(),Math.max(...this.data.map(r=>r.length),1));}
  getLastRow(){return this.data.length;}
+ getLastColumn(){return Math.max(...this.data.map(r=>r.length),0);}
  getMaxRows(){return this.max;}
  insertRowsAfter(_row,count){this.max+=count;}
  setFrozenRows(){}
@@ -56,7 +57,7 @@ function appContext(options={}){
   [['First Name','Last Name','Email','Cohort/Class #'],['Example','Student','student@example.test','Class1']]:[['First Name','Last Name','Email','Cohort/Class #']]);
  const props={RUN_MODE:'TEST',SPREADSHEET_ID:'TEST',PRODUCTION_SPREADSHEET_ID:'synthetic-production',OWNER_EMAIL:'owner@example.test',NOTIFICATION_TO:'scheduling@example.test',PARSER_URL:'https://staging.example.test/parse-calendar',PARSER_API_TOKEN:'fake-test-token',ARCHIVE_FOLDER_ID:'TEST_FOLDER',NOTIFICATIONS_FROM:'2026-10-01T00:00:00Z'};
  const blob={getName:()=> 'Calendar-RickyRescue-BrewsterLeeCou-202610-202611.pdf',getBytes:()=>[1,2,3],getContentType:()=> 'application/pdf',copyBlob(){return this;},setName(){return this;}};
- const message={getId:()=> 'message1',getFrom:()=> 'donotreply@platinumed.com',getSubject:()=> 'Calendar - Brewster Lee County',getDate:()=>new Date('2026-10-17T12:00:00Z'),getAttachments:()=>options.missingAttachment?[]:[blob]};
+ const message={getId:()=> 'message1',getFrom:()=> 'donotreply@platinumed.com',getSubject:()=> 'Calendar - Brewster Lee County',getDate:()=>new Date('2026-10-17T12:00:00Z'),getAttachments:()=>options.missingAttachment?[]:Array(options.attachmentCount||1).fill(blob)};
  class Store {
   constructor(_ss,_hash,options={}){this.projectionHashes=options.projectionHashes||{};}
   load(){if(options.storageFailure)throw Error('Sheets unavailable');return state;}save(){if(options.commitFailure)throw Error('Commit unavailable');}project(){}reviewLink(id){return 'https://example.test/'+id;}
@@ -322,4 +323,55 @@ test('failed heartbeat read cannot erase a successful heartbeat or overdue remin
  f.ctx.PropertiesService.getScriptProperties=()=>p;
  assert.throws(()=>f.ctx.clinicalSession_(()=>{throw Error('processing failed');},'DISPATCH'));
  const failed=JSON.parse(f.fallback.RR_DIAG_DISPATCH);assert.equal(failed.next_due_at,'2026-11-03T13:00:00Z');assert.equal(failed.last_success_at,'2026-11-01T00:00:00Z');
+});
+
+test('quiet cancellation scans avoid the roster and preserve business state',()=>{
+ const f=appContext();let rosterReads=0;
+ f.ctx.clinicalRoster_=()=>{rosterReads++;throw Error('Quiet run must not open roster');};
+ const before=JSON.stringify(f.state.students);
+ f.ctx.dispatchClinicalNotifications();f.ctx.dispatchClinicalNotifications();
+ assert.equal(rosterReads,0);assert.equal(JSON.stringify(f.state.students),before);
+ assert.equal(JSON.parse(f.fallback.RR_CANCEL_CURSOR).scans,2);
+ assert.equal(JSON.parse(f.fallback.RR_DIAG_DISPATCH).status,'COMPLETED');
+});
+test('candidate cancellations still load a fresh roster and read failures hold reminders without advancing cursor',()=>{
+ const m={getId:()=> 'new-cancel',getFrom:()=> 'donotreply@platinumed.com',getDate:()=>new Date(),getPlainBody:()=> 'Brewster Ambulance Service clinical cancelled',getRawContent:()=> ''};
+ const f=appContext({cancellationMessage:m});let calls=0,ownerOnly;
+ f.ctx.clinicalRoster_=()=>{calls++;throw Error('Roster unavailable');};
+ f.ctx.ClinicalEngine={...E,dispatch(_state,env){ownerOnly=env.ownerOnly;}};
+ f.ctx.dispatchClinicalNotifications();assert.equal(calls,1);assert.equal(ownerOnly,true);
+ assert.equal(f.fallback.RR_CANCEL_CURSOR,undefined);assert.equal(JSON.parse(f.fallback.RR_DIAG_DISPATCH).status,'HELD');
+ assert.ok(f.state.reviews.some(r=>r.category==='CANCELLATION_WATCHDOG_FAILURE'));
+});
+test('bounded identity reads accept corrected emails and ignore unrelated tracker columns',()=>{
+ const f=appContext(),sheet=f.ss.getSheetByName('Students'),calls=[];
+ sheet.data=[['Timestamp','First Name','Last Name','Email','Phone','Cohort/Class #',...Array(27).fill('Other'),'Student ID'],
+  ['old','Example','Student','corrected@example.test','phone','Class1',...Array(27).fill('unrelated'),'stable-id']];
+ sheet.getDataRange=()=>{throw Error('Full tracker read forbidden');};
+ const roster=f.ctx.clinicalRoster_(f.ss,f.state,{now:Date.now(),hash:sha,read(label,fn){calls.push(label);return fn();}});
+ assert.equal(roster.length,1);assert.equal(roster[0].id,'stable-id');assert.equal(roster[0].email,'corrected@example.test');
+ assert.equal(roster.issues.length,0);assert.ok(calls.includes('ROSTER_STUDENTS_IDENTITY_2'));
+ assert.ok(calls.includes('ROSTER_ARCHIVE_HEADERS'));
+ const original=sheet.getRange.bind(sheet),rects=[];sheet.getRange=(...args)=>{rects.push(args);return original(...args);};
+ f.ctx.clinicalRoster_(f.ss,f.state,{now:Date.now(),hash:sha});
+ assert.deepEqual(rects,[[1,1,1,34],[2,2,1,5],[2,34,1,1]]);
+});
+test('duplicate Student ID headers fail closed, and reordered required columns remain valid',()=>{
+ const f=appContext(),sheet=f.ss.getSheetByName('Students');
+ sheet.data=[['Email','Student ID','Last Name','First Name','Cohort/Class #'],['student@example.test','stable','Student','Example','Class1']];
+ assert.equal(f.ctx.clinicalRoster_(f.ss,f.state,{now:Date.now(),hash:sha})[0].id,'stable');
+ sheet.data[0].push('Student ID');assert.throws(()=>f.ctx.clinicalRoster_(f.ss,f.state,{now:Date.now(),hash:sha}),/Student ID/);
+});
+test('expired read budgets do not start a new provider call or sleep',()=>{
+ const f=appContext();let calls=0,sleeps=0;f.ctx.Utilities.sleep=()=>sleeps++;
+ assert.throws(()=>f.ctx.clinicalRead_('ROSTER_STUDENTS_IDENTITY_1',()=>calls++,{shouldStop:()=>true}),/budget exhausted/);
+ assert.equal(calls,0);assert.equal(sleeps,0);
+});
+test('ingestion stops between attachments and replays the unfinished page',()=>{
+ const f=appContext({attachmentCount:2}),session=f.ctx.clinicalSession_;
+ f.ctx.clinicalSession_=(fn,kind)=>session((state,env,store,ss)=>fn(state,{...env,shouldStop:()=>f.stats().fetches>=1},store,ss),kind);
+ f.ctx.ingestClinicalCalendars();assert.equal(f.stats().fetches,1);assert.equal(f.state.runs[0].status,'CONTINUATION');
+ assert.equal(f.state.gmail_offset||0,0);assert.equal(f.state.sources.length,1);
+ f.ctx.clinicalSession_=session;f.ctx.ingestClinicalCalendars();
+ assert.equal(f.stats().fetches,2);assert.equal(f.state.sources.length,2);assert.equal(f.state.runs[1].status,'COMPLETED');
 });
