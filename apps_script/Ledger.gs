@@ -15,8 +15,10 @@ var ClinicalLedger = class {
   ensure(sheet,last) {if(last>sheet.getMaxRows()) sheet.insertRowsAfter(sheet.getMaxRows(),last-sheet.getMaxRows());}
   load() {
     const head=this.sheet('RR_V2_Head',['SHA256','Bank','First chunk row','Chunk count']);
-    if(head.getLastRow()<2) return ClinicalEngine.init({});
     const [digest,bank,start,count]=this.read('LEDGER_HEAD_READ',()=>head.getRange(2,1,1,4).getValues())[0];
+    // Read the fixed pointer directly. A sheet-wide row-count lookup adds a
+    // synchronous metadata call before the deadline-guarded pointer read.
+    if([digest,bank,start,count].every(value=>value===''||value==null)) return ClinicalEngine.init({});
     if(!digest || !['RR_V2_Chunks_A','RR_V2_Chunks_B'].includes(bank)||!Number.isInteger(start)||!Number.isInteger(count)||start!==2||count<1) throw Error('Invalid ledger commit pointer');
     const sheet=this.sheet(bank,['Snapshot SHA256','Index','JSON fragment']);
     const chunks=this.read('LEDGER_CHUNKS_READ',()=>sheet.getRange(start,1,count,3).getValues());

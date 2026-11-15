@@ -1,5 +1,7 @@
 # Streamlined scheduling and failure monitoring
 
+The `ledger-budget-recovery-v1` candidate removes the ledger-head row-count lookup and safely defers only dispatch deadlines reached before ledger loading completes. The independent health monitor retains the old success heartbeat and still detects persistent outages/overdue reminders. See [candidate behavior and release gates](LEDGER-BUDGET-RELEASE.md) and [the separate Phase 1 integration dependency](PHASE1-SCHEDULER-INTEGRATION.md). Later sections describe the preceding reliability releases and unchanged safeguards.
+
 The five-minute dispatcher retains its reminder timing, recipients, cancellation preflight, exclusive business lock and durable send protocol. This update reduces service work and adds diagnostics; it does not guarantee that Google will never fail an execution before the script starts.
 
 ## Roster read reliability
