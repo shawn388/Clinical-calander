@@ -45,6 +45,18 @@ test('failure before head commit leaves previous snapshot authoritative',()=>{
 test('corrupted committed ledger is rejected before notifications can run',()=>{
  const f=ledger(),store=f.make(),s=store.load();store.save(s);f.ss.getSheetByName('RR_V2_Chunks_A').data[1][2]='J:tampered';assert.throws(()=>f.make().load(),/checksum/);
 });
+test('ledger loads fixed pointer without asking Sheets for a row count',()=>{
+ const f=ledger(),store=f.make(),state=store.load();state.marker='committed';store.save(state);
+ f.ss.getSheetByName('RR_V2_Head').getLastRow=()=>{throw Error('Unbounded metadata call forbidden');};
+ const writes=f.ss.writes;assert.equal(f.make().load().marker,'committed');assert.equal(f.ss.writes,writes);
+});
+test('empty ledger initializes but every partial head fails closed',()=>{
+ const f=ledger();assert.equal(f.make().load().notifications.length,0);
+ const head=f.ss.getSheetByName('RR_V2_Head');
+ for(const pointer of [['digest','','',''],['','RR_V2_Chunks_A',2,1],['','','',1]]) {
+  head.getRange(2,1,1,4).setValues([pointer]);assert.throws(()=>f.make().load(),/Invalid ledger commit pointer/);
+ }
+});
 test('projection provides a direct review-row link and escapes formulas',()=>{
  const f=ledger(),store=f.make(),s=store.load();s.reviews.push({id:'r1',status:'OPEN',category:'UNKNOWN',reason:'=HYPERLINK("bad")',instructions:'Fix source'});store.project(s);
  assert.match(store.reviewLink('r1'),/#gid=\d+&range=A2:J2$/);assert.ok(f.ss.getSheetByName('RR_V2_Reviews').data[1][5].startsWith("'="));
@@ -205,6 +217,67 @@ function seedHealthy(f,now=Date.now()) {
  f.fallback.RR_CANCEL_CURSOR=JSON.stringify({last_success_at:new Date(now).toISOString()});
  f.fallback.RR_SCHEDULE_HEALTH=JSON.stringify({ingest_success_at:new Date(now).toISOString(),sites:['Brewster Ambulance Service Lee County','Brewster Ambulance Service Collier'].map(site=>({site,published_at:new Date(now).toISOString()}))});
 }
+function expiredLoad(f) {
+ let now=Date.now();const initial=now,BaseDate=Date,Store=f.ctx.ClinicalLedger;
+ f.ctx.Date=class extends BaseDate {static now(){return now;}};
+ f.ctx.ClinicalLedger=class extends Store {
+  constructor(ss,hash,options){super(ss,hash,options);this.options=options;}
+  load(){now+=241000;return this.options.read('LEDGER_HEAD_READ',()=>{throw Error('Expired read must not execute');});}
+ };
+ return {initial,restore(){f.ctx.ClinicalLedger=Store;},advance(ms){now+=ms;},now:()=>now};
+}
+test('pre-load dispatch deadline defers without mail, state changes or a new success heartbeat',()=>{
+ const f=appContext(),clock=expiredLoad(f);seedHealthy(f,clock.initial);
+ const config=f.ctx.PropertiesService.getScriptProperties().getProperties();
+ config.RUN_MODE='PRODUCTION';config.PRODUCTION_CUTOVER_APPROVED='true';config.LIVE_EMAIL='true';
+ f.fallback.RR_CANCEL_CURSOR=JSON.stringify({last_success_at:new Date(clock.initial).toISOString(),seen_ids:['keep']});
+ const cursor=f.fallback.RR_CANCEL_CURSOR,before=JSON.stringify(f.state);let processed=false;
+ assert.equal(f.ctx.clinicalSession_(()=>{processed=true;},'DISPATCH'),false);
+ const d=JSON.parse(f.fallback.RR_DIAG_DISPATCH);
+ assert.equal(d.status,'DEFERRED');assert.equal(d.error,'EXECUTION_BUDGET_EXHAUSTED');assert.equal(d.consecutive_failures,1);
+ assert.equal(d.last_success_at,new Date(clock.initial).toISOString());assert.equal(processed,false);
+ assert.equal(JSON.stringify(f.state),before);assert.equal(f.fallback.RR_CANCEL_CURSOR,cursor);assert.equal(f.stats().released,1);
+ assert.ok(!Object.keys(f.fallback).some(k=>k.startsWith('RR_FATAL_')));
+ assert.ok(f.logs.some(r=>r.phase==='DEFERRED'&&r.edge==='TERMINAL'));
+ assert.ok(Object.entries(f.fallback).some(([key,value])=>key.startsWith('RR_EXEC_')&&JSON.parse(value).status==='DEFERRED'));
+ clock.restore();f.ctx.dispatchClinicalNotifications();
+ assert.equal(JSON.parse(f.fallback.RR_DIAG_DISPATCH).status,'COMPLETED');
+ assert.equal(JSON.parse(f.fallback.RR_DIAG_DISPATCH).consecutive_failures,0);
+});
+test('repeated pre-load deferrals remain visible to the independent health monitor',()=>{
+ const f=appContext(),clock=expiredLoad(f);seedHealthy(f,clock.initial);
+ const due=new Date(clock.initial-11*60000).toISOString();
+ const d=JSON.parse(f.fallback.RR_DIAG_DISPATCH);d.next_due_at=due;f.fallback.RR_DIAG_DISPATCH=JSON.stringify(d);
+ for(let i=0;i<4;i++)f.ctx.clinicalSession_(()=>assert.fail('Processing forbidden'),'DISPATCH');
+ const diag=JSON.parse(f.fallback.RR_DIAG_DISPATCH);assert.equal(diag.consecutive_failures,4);assert.equal(diag.next_due_at,due);
+ const result=f.ctx.clinicalDeliveryHealth_(f.ctx.clinicalConfig_(),f.ctx.PropertiesService.getScriptProperties(),clock.now());
+ assert.equal(result.status,'ATTENTION');assert.ok(result.issues.some(x=>/dispatcher/.test(x)));assert.ok(result.issues.some(x=>/overdue/.test(x)));
+ assert.equal(JSON.parse(f.fallback.RR_DELIVERY_HEALTH).status,'DRY_RUN');
+});
+test('deadline errors after ledger load or during ingestion still fail and create an owner failure record',()=>{
+ const f=appContext();
+ assert.throws(()=>f.ctx.clinicalSession_(()=>f.ctx.clinicalRead_('READ',()=>assert.fail(),{shouldStop:()=>true}),'DISPATCH'),/budget exhausted/);
+ assert.equal(JSON.parse(f.fallback.RR_DIAG_DISPATCH).status,'FAILED');
+ assert.ok(Object.entries(f.fallback).some(([k,v])=>k.startsWith('RR_FATAL_')&&JSON.parse(v).category==='EXECUTION_BUDGET_EXHAUSTED'));
+ const g=appContext();expiredLoad(g);assert.throws(()=>g.ctx.ingestClinicalCalendars(),/budget exhausted/);
+ assert.equal(JSON.parse(g.fallback.RR_DIAG_INGEST).status,'FAILED');
+});
+test('ordinary storage failures cannot be mistaken for safe deadline deferrals',()=>{
+ const f=appContext();f.ctx.ClinicalLedger=class {load(){throw Error('Execution budget exhausted before LEDGER_HEAD_READ');}};
+ assert.throws(()=>f.ctx.dispatchClinicalNotifications(),/budget exhausted/);
+ assert.equal(JSON.parse(f.fallback.RR_DIAG_DISPATCH).status,'FAILED');assert.equal(f.stats().released,1);
+});
+test('owner alerts distinguish integrity failures from service errors and preserve send deduplication',()=>{
+ for(const [reason,integrity] of [['Sheets unavailable',false],['Ledger snapshot checksum mismatch',true]]) {
+  const f=appContext(),config={...f.ctx.clinicalConfig_(),liveEmail:true};let sends=0;
+  f.ctx.GmailApp.createDraft=(to,subject,body)=>{
+   assert.equal(to,config.owner);assert.match(subject,integrity?/ledger failure/:/execution failure/);
+   assert.match(body,integrity?/only after confirming corruption/:/does not justify restoring/);
+   return {getId:()=> 'synthetic-draft',send(){sends++;return {getId:()=> 'synthetic-message'};}};
+  };
+  f.ctx.clinicalFallbackAlert_(config,Error(reason));f.ctx.clinicalFallbackAlert_(config,Error(reason));assert.equal(sends,1);
+ }
+});
 test('independent health check needs no Sheets access and stays silent when healthy',()=>{
  const f=appContext({storageFailure:true});seedHealthy(f);f.ctx.SpreadsheetApp.openById=()=>{throw Error('Health must not load Sheets');};
  assert.equal(f.ctx.checkClinicalDeliveryHealth().status,'HEALTHY');assert.equal(f.fallback.RR_DELIVERY_HEALTH,undefined);
