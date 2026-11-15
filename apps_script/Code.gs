@@ -28,7 +28,7 @@ function clinicalJSON_(text,fallback) {
 }
 // This identifier travels with entry, phase and terminal records; no Google call
 // (including UUID or properties access) is needed to create the entry record.
-const CLINICAL_RELEASE_='roster-read-reliability-v2';
+const CLINICAL_RELEASE_='ledger-budget-recovery-v1';
 function clinicalTrace_(kind,event) {
   const started=Date.now(),runId=started.toString(36)+'-'+Math.random().toString(36).slice(2,14);
   const functions={DISPATCH:'dispatchClinicalNotifications',INGEST:'ingestClinicalCalendars',CANCELLATIONS:'watchClinicalCancellations',HEALTH:'checkClinicalHealth',DELIVERY_HEALTH:'checkClinicalDeliveryHealth',VIEWS:'refreshClinicalViews'};
@@ -81,7 +81,10 @@ function clinicalTrace_(kind,event) {
 // Read retries only. Never wrap ledger commits, draft creation or email sending.
 function clinicalRead_(label,fn,context) {
   for(let attempt=0;;attempt++) {
-    if(context&&context.shouldStop&&context.shouldStop()) throw Error('Execution budget exhausted before '+label);
+    if(context&&context.shouldStop&&context.shouldStop()) {
+      const error=Error('Execution budget exhausted before '+label);
+      error.code='CLINICAL_EXECUTION_BUDGET';throw error;
+    }
     if(context&&context.stage)context.stage(label);
     const at=Date.now();
     try {const value=fn();if(context&&context.after)context.after(label,Date.now()-at);return value;} catch(error) {
@@ -95,7 +98,7 @@ function clinicalRead_(label,fn,context) {
 }
 function clinicalSession_(fn,kind='GENERAL',event) {
   const trace=clinicalTrace_(kind,event),started=trace.started,deadline=started+240000,diagKey='RR_DIAG_'+kind;
-  let props,prior={},config,lock,acquired=false,priorLoaded=false,terminal='FAILED',businessError;
+  let props,prior={},config,lock,acquired=false,priorLoaded=false,stateLoaded=false,terminal='FAILED',businessError;
   const diag={run_id:trace.runId,release:CLINICAL_RELEASE_,started_at:new Date(started).toISOString(),stage:'ENTRY',status:'RUNNING',read_retries:0};
   const stage=value=>{diag.stage=value;diag.stage_at=new Date().toISOString();trace.stage(value);};
   const op=(label,fn)=>{stage(label);const at=Date.now();try{const value=fn();trace.record(label,'AFTER',Date.now()-at);return value;}catch(error){trace.record(label,'ERROR',Date.now()-at);throw error;}};
@@ -118,6 +121,7 @@ function clinicalSession_(fn,kind='GENERAL',event) {
     const priorHashes=JSON.stringify(cache.hashes||{});
     const store=new ClinicalLedger(ss,clinicalHash_,{projectionHashes:cache.hashes||{},stage,op,read:(label,read)=>clinicalRead_(label,read,context)});
     const state=op('LEDGER_LOAD',()=>store.load());
+    stateLoaded=true;
     const env=Object.assign({},config,context,{props,now:Date.now(),hash:clinicalHash_,
       shouldStop:()=>Date.now()>deadline-30000,
       read:(label,read)=>clinicalRead_(label,read,context),reviewLink:id=>store.reviewLink(id,state),
@@ -149,6 +153,15 @@ function clinicalSession_(fn,kind='GENERAL',event) {
     if(props.getProperty('RR_SCHEDULE_HEALTH')!==healthText)props.setProperty('RR_SCHEDULE_HEALTH',healthText);
     terminal=diag.status;heartbeat();
   } catch(error) {
+    // Before ledger load, dispatch cannot have attempted a student send. Leave
+    // business state/cursors untouched and let the existing timer try again.
+    // The old success heartbeat remains authoritative for independent health
+    // monitoring of persistent outages and overdue reminders.
+    if(kind==='DISPATCH'&&!stateLoaded&&error.code==='CLINICAL_EXECUTION_BUDGET') {
+      diag.status='DEFERRED';diag.failed_stage=diag.stage;diag.error='EXECUTION_BUDGET_EXHAUSTED';
+      diag.ended_at=new Date().toISOString();diag.consecutive_failures=(prior.consecutive_failures||0)+1;
+      terminal='DEFERRED';heartbeat();return false;
+    }
     businessError=error;diag.status='FAILED';diag.failed_stage=diag.failed_stage||diag.stage;diag.error='EXECUTION_FAILED';diag.ended_at=new Date().toISOString();
     diag.consecutive_failures=(prior.consecutive_failures||0)+1;heartbeat();
     if(config)try{op('OWNER_FAILURE_ALERT',()=>clinicalFallbackAlert_(config,error));}catch(_alertError){trace.record('OWNER_FAILURE_ALERT','ERROR');}throw error;
@@ -166,14 +179,16 @@ function clinicalFallbackAlert_(config,error) {
   let entry;
   try {entry=JSON.parse(properties.getProperty(key)||'null');}catch(_e){entry=null;}
   if(entry&&['API_ACCEPTED','UNCERTAIN','PREPARING','SENDING'].includes(entry.status)) return;
-  entry={id,category:'LEDGER_OR_DISPATCH_FAILURE',reason,status:config.liveEmail?'PREPARING':'DRY_RUN',at:new Date().toISOString()};
+  const integrity=/^Error: (Invalid ledger commit pointer|Incomplete ledger snapshot|Invalid ledger fragment encoding|Ledger snapshot checksum mismatch)$/.test(reason);
+  entry={id,category:integrity?'LEDGER_INTEGRITY_FAILURE':error.code==='CLINICAL_EXECUTION_BUDGET'?'EXECUTION_BUDGET_EXHAUSTED':'LEDGER_OR_DISPATCH_FAILURE',reason,status:config.liveEmail?'PREPARING':'DRY_RUN',at:new Date().toISOString()};
   properties.setProperty(key,JSON.stringify(entry));
   if(!config.liveEmail) return;
   try {
-    const subject='Clinical scheduling ledger failure [RR-FATAL:'+id+']';
+    const subject='Clinical scheduling '+(integrity?'ledger':'execution')+' failure [RR-FATAL:'+id+']';
     const body='Category: '+entry.category+'\nStudent/PDF: scheduler ledger\nAffected date: '+entry.at+'\nReason: '+reason+
       '\nAffected workbook: https://docs.google.com/spreadsheets/d/'+config.sheet+'/edit\nFailure record: Script Properties '+key+
-      '\nResolve: Inspect the RR_V2_Head pointer and committed chunks. Restore a verified snapshot; inspect Sent mail before retrying any uncertain notification. Then review the trigger execution failure.';
+      '\nResolve: '+(integrity?'Verify the RR_V2_Head pointer and committed chunk checksum. Restore a snapshot only after confirming corruption and reconciling newer accepted/uncertain sends. ':'Inspect the failed execution and the latest dispatcher/health diagnostics. A timeout or service error alone does not justify restoring the ledger. ')+
+      'Inspect Sent mail before retrying any uncertain notification. Verify the next scheduled run.';
     const draft=GmailApp.createDraft(config.owner,subject,body);
     entry.draft_id=draft.getId();entry.status='SENDING';properties.setProperty(key,JSON.stringify(entry));
     entry.message_id=draft.send().getId();entry.status='API_ACCEPTED';properties.setProperty(key,JSON.stringify(entry));
