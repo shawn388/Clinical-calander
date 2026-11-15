@@ -1,6 +1,6 @@
 # Ledger budget recovery candidate
 
-Status: PREPARATION ONLY. No production installation, staging execution, trigger change or mail send is established by this document.
+Status: EMAIL-DISABLED STAGING PASSED on November 15, 2026. See [exact cloud acceptance evidence](PR8-STAGING-VALIDATION.md). No production installation, merge, trigger change or real mail occurred.
 
 ## Incident and change
 
@@ -23,10 +23,12 @@ Run `node --test tests/*.test.cjs`. New regressions prohibit the metadata call, 
 
 Local result: 112 passed, zero failed, one private-fixture test skipped (113 total). The separate Python parser suite could not start under the system Python because reportlab is absent; the repository CI environment installs its pinned development dependencies and must pass before release. Parser source is unchanged.
 
+GitHub CI subsequently passed the Python and JavaScript suites. Normal cloud staging ingestion/dispatch/health, guarded deadline/failure tests, and final recovery passed. Exact helper/core revisions and the independently verified final staging checksum are recorded in PR8-STAGING-VALIDATION.md.
+
 ## Remaining acceptance and release sequence
 
 1. Review and pin the candidate commit; retain this as a separate scheduler release dependency for Phase 1. Do not add these files to the reduced W009 mCE harness.
-2. In the separately approved scheduler TEST project, verify identity, workbook ID, LIVE_EMAIL=false, exact source hashes and existing permissions. Install Code.gs and Ledger.gs together, keeping Engine.gs and the manifest unchanged. Rehearse normal dispatch/health and a synthetic pre-load deadline using fictional state, capturing DEFERRED diagnostics, retained old success time, no mail and subsequent recovery. Local mocks do not establish this cloud evidence.
+2. COMPLETED November 15: the approved scheduler TEST project retained its identity, workbook ID, LIVE_EMAIL=false, scopes and zero triggers. Code.gs and Ledger.gs were installed together; Engine.gs and the manifest were unchanged. Cloud normal runs, pre-load deferral, health fault detection, integrity rejection and recovery passed without mail. See the pinned staging evidence before any release; repeat if core candidate bytes change.
 3. Before any production release, obtain approval for the exact commit and installation. Merging main also redeploys the existing Render service, though parser source is unchanged. Back up and checksum the fresh authoritative ledger and reconcile accepted/uncertain sends.
 4. Briefly pause live email for installation, install the two files, verify source and saved settings, and restore the existing approved mail policy. Preserve all trigger owners, schedules and native failure settings. Do not run an extra live dispatcher to force a reminder test.
 5. Verify ordinary timed dispatch and independent health, then inspect Gmail and the checksum-verified ledger after the next due batch. Exactly one Sent marker and accepted attempt are required for each unsuperseded reminder; check bounces and legitimate cancellations/reschedules.
